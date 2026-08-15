@@ -1,0 +1,7 @@
+dataset,model,metric,value,train_s,size_mb
+covtype_binary,LightGBM-ES,auc,0.9499,4.4,6.76
+covtype_binary,SXEv3-boost,auc,0.9521,4.01,1.43
+friedman1_noise,LightGBM-ES,rmse,1.0945,1.3,0.79
+friedman1_noise,SXEv3-boost,rmse,1.0883,1.2,0.12
+california,LightGBM-ES,rmse,0.4333,1.3,2.4
+california,SXEv3-boost,rmse,0.4437,4.1,0.22

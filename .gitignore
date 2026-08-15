@@ -1,0 +1,26 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+wheelhouse/
+_skbuild/
+
+# compiled extensions and the reference prototype's shared library
+*.so
+*.dylib
+*.pyd
+
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+.DS_Store
+.idea/
+.vscode/
+
+# benchmark output
+benchmarks/results.csv
