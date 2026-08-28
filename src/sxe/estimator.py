@@ -8,7 +8,7 @@ import warnings
 import numpy as np
 import sklearn
 from sklearn.base import BaseEstimator, ClassifierMixin, RegressorMixin
-from sklearn.linear_model import ElasticNet, ElasticNetCV
+from sklearn.linear_model import ElasticNet, ElasticNetCV, LogisticRegression
 from sklearn.utils.multiclass import check_classification_targets
 from sklearn.utils.validation import check_is_fitted
 
@@ -60,6 +60,49 @@ _ENET_USES_ALPHAS_INT = _sklearn_at_least(1, 7)
 def _enet_path_size(n_alphas):
     key = "alphas" if _ENET_USES_ALPHAS_INT else "n_alphas"
     return {key: int(n_alphas)}
+
+
+def _fit_platt(scores, y):
+    """Platt scaling of a 1-D score against 0/1 targets: (a, b) or None.
+
+    Fits ``p = sigmoid(a * score + b)`` by maximum likelihood against Platt's
+    smoothed targets -- (N+ + 1)/(N+ + 2) and 1/(N- + 2) rather than 1 and 0 --
+    which keeps the optimum finite when the fold happens to be separable. The
+    smoothing is applied by giving each observation both labels with weights
+    ``t`` and ``1 - t``, so an ordinary logistic solver optimises the smoothed
+    objective exactly.
+
+    Returns None when the fold cannot identify a calibration (one class only,
+    a constant score, or a fit that came out non-increasing) -- the caller then
+    falls back to clipping rather than shipping a map that reorders the scores.
+    """
+    scores = np.asarray(scores, dtype=np.float64).ravel()
+    y = (np.asarray(y).ravel() > 0.5).astype(np.float64)
+    n_pos, n_neg = float(y.sum()), float(len(y) - y.sum())
+    if n_pos == 0 or n_neg == 0 or not np.isfinite(scores).all():
+        return None
+    if np.ptp(scores) <= 0:
+        return None
+
+    t = np.where(y > 0.5, (n_pos + 1.0) / (n_pos + 2.0), 1.0 / (n_neg + 2.0))
+    Xd = np.repeat(scores, 2).reshape(-1, 1)
+    yd = np.tile([1, 0], len(scores))
+    wd = np.empty(2 * len(scores))
+    wd[0::2], wd[1::2] = t, 1.0 - t
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        # C is large because the smoothed targets, not a penalty, are what
+        # keep the optimum finite; this is maximum likelihood, not ridge.
+        lr = LogisticRegression(C=1e10, max_iter=2000).fit(Xd, yd, sample_weight=wd)
+    a, b = float(lr.coef_[0, 0]), float(lr.intercept_[0])
+    if not (np.isfinite(a) and np.isfinite(b)) or a <= 0.0:
+        return None
+    return a, b
+
+
+def _apply_platt(ab, scores):
+    a, b = ab
+    return 1.0 / (1.0 + np.exp(-(a * np.asarray(scores, dtype=np.float64) + b)))
 
 
 def _make_rng(random_state):
@@ -119,11 +162,23 @@ class _BaseSXE(BaseEstimator):
         Random cut-points per candidate feature when splitter="random".
     bundle_binary_features : bool, default=False
         Enable exclusive feature bundling for binary columns.
+    calibrate : {"sigmoid", None}, default="sigmoid"
+        Classifier only; ignored by ``SXERegressor``. The ensemble fits
+        squared error against 0/1 targets, so its raw output is a regression
+        score that routinely falls outside [0, 1] and is not a probability.
+        "sigmoid" fits Platt scaling on the validation fold, turning it into
+        one. Ranking is untouched -- the map is strictly increasing -- so AUC
+        is unchanged while log-loss and Brier score improve substantially.
+        None restores the previous behaviour of clipping the raw score into
+        [0, 1], which is cruder *and* perturbs AUC by collapsing both tails
+        into ties.
     hybrid_min : int, default=600
-        Node size above which the histogram-subtraction grower is used. This is
-        not purely a speed knob: the two growers recurse in different orders
-        (smaller-child-first vs left-first) and share one per-tree RNG stream,
-        so changing it changes which trees get grown, not just how fast.
+        Node size above which the histogram-subtraction grower is used.
+        Both growers recurse smaller-child-first and pick splits by the same
+        rule, so this selects an implementation, not a model: the fitted trees
+        are unchanged. They do sum histograms differently (subtraction versus
+        direct accumulation), so equality is to floating-point rounding rather
+        than by construction.
     n_alphas : int, default=20
         Alphas in the weight-fit regularisation path.
     weight_cv : int, default=3
@@ -163,6 +218,7 @@ class _BaseSXE(BaseEstimator):
         splitter="best",
         n_thresholds=2,
         bundle_binary_features=False,
+        calibrate="sigmoid",
         hybrid_min=600,
         n_alphas=20,
         weight_cv=3,
@@ -187,6 +243,7 @@ class _BaseSXE(BaseEstimator):
         self.splitter = splitter
         self.n_thresholds = n_thresholds
         self.bundle_binary_features = bundle_binary_features
+        self.calibrate = calibrate
         self.hybrid_min = hybrid_min
         self.n_alphas = n_alphas
         self.weight_cv = weight_cv
@@ -380,6 +437,7 @@ class _BaseSXE(BaseEstimator):
         self._members = np.arange(self.ensemble_.n_members, dtype=np.int32)
         self.weights_ = np.ascontiguousarray(weights, dtype=np.float64)
         self.intercept_ = float(intercept)
+        self.calibrator_ = self._fit_calibrator(Xval, y_val, n_jobs)
 
         nodes, leaves = self.ensemble_.structure(self._members)
         self.n_iter_ = int(n_batches)
@@ -400,6 +458,10 @@ class _BaseSXE(BaseEstimator):
                 f"{self.fit_time_:.2f}s"
             )
         return self
+
+    def _fit_calibrator(self, Xval, y_val, n_jobs):
+        """Regression output is already on the target's scale."""
+        return None
 
     # -- prediction ----------------------------------------------------------
     def _score_validated(self, X):
@@ -499,7 +561,37 @@ class SXERegressor(RegressorMixin, _BaseSXE):
         return self._raw_predict(X)
 
 
-class _BinaryCore(_BaseSXE):
+class _CalibratesBinary:
+    """Turns one binary sub-model's regression score into a probability.
+
+    Mixed into both the public classifier's own binary path and the
+    one-vs-rest sub-models, so a class score means the same thing either way.
+    """
+
+    def _fit_calibrator(self, Xval, y_val, n_jobs):
+        if self.calibrate is None:
+            return None
+        if self.calibrate != "sigmoid":
+            raise ValueError(f"calibrate must be 'sigmoid' or None, got {self.calibrate!r}")
+        # The fold is the one already carved for early stopping and the weight
+        # fit, so the calibration is mildly optimistic on it. Carving a fourth,
+        # dedicated fold costs more accuracy (less data to grow on) than the
+        # reuse costs calibration -- measured, not assumed.
+        s = self.ensemble_.predict_weighted(
+            Xval, self._members, self.weights_, self.intercept_, n_jobs
+        )
+        return _fit_platt(s, y_val)
+
+    def _probability(self, scores):
+        """Map raw ensemble scores onto [0, 1]."""
+        if getattr(self, "calibrator_", None) is not None:
+            return _apply_platt(self.calibrator_, scores)
+        # Uncalibrated fallback. Clipping is crude: it collapses both tails
+        # into ties, which perturbs ranking metrics as well as log-loss.
+        return np.clip(scores, 1e-6, 1 - 1e-6)
+
+
+class _BinaryCore(_CalibratesBinary, _BaseSXE):
     """One binary sub-model of a one-vs-rest classifier.
 
     Carries the same parameters as the public estimators but is never
@@ -512,7 +604,7 @@ class _BinaryCore(_BaseSXE):
         return self._fit(X, np.asarray(y, dtype=np.float64))
 
 
-class SXEClassifier(ClassifierMixin, _BaseSXE):
+class SXEClassifier(ClassifierMixin, _CalibratesBinary, _BaseSXE):
     """Sparse eXtra Ensemble for classification.
 
     Binary targets are handled as regression on {0, 1} (the Brier-score /
@@ -578,23 +670,29 @@ class SXEClassifier(ClassifierMixin, _BaseSXE):
         check_is_fitted(self)
         X = _validate(self, X, reset=False, dtype=np.float64, ensure_2d=True)
         if self.estimators_ is None:
-            p = np.clip(self._score_validated(X), 1e-6, 1 - 1e-6)
+            p = self._probability(self._score_validated(X))
             return np.column_stack([1.0 - p, p])
-        scores = np.column_stack(
-            [np.clip(s._score_validated(X), 1e-6, 1 - 1e-6) for s in self.estimators_]
+        # one-vs-rest: each sub-model maps its own score onto [0, 1] with its
+        # own calibration, then the columns are normalised to a distribution
+        scores = np.column_stack([s._probability(s._score_validated(X)) for s in self.estimators_])
+        total = scores.sum(axis=1, keepdims=True)
+        return np.divide(
+            scores, total, out=np.full_like(scores, 1.0 / scores.shape[1]), where=total > 0
         )
-        return scores / scores.sum(axis=1, keepdims=True)
 
     def predict_proba(self, X):
         return self._class_scores(X)
 
     def predict(self, X):
-        check_is_fitted(self)
+        # Thresholding the probability rather than the raw score keeps predict
+        # and predict_proba consistent: calibration moves the raw score that
+        # corresponds to p = 0.5 away from 0.5.
+        p = self._class_scores(X)
         if self.estimators_ is None:
             # threshold rather than argmax, so p == 0.5 resolves to the
             # positive class as it does elsewhere in the binary reduction
-            return self.classes_[(self._raw_predict(X) >= 0.5).astype(int)]
-        return self.classes_[np.argmax(self._class_scores(X), axis=1)]
+            return self.classes_[(p[:, 1] >= 0.5).astype(int)]
+        return self.classes_[np.argmax(p, axis=1)]
 
     @property
     def feature_importances_(self):

@@ -311,8 +311,18 @@ int32_t grow_node_legacy(GrownTree& T, const uint8_t* X, const double* y,
     if (split == lo || split == hi) return id;  // safety
 
     T.feat[id] = best_f; T.thr[id] = (uint8_t)best_t; T.gain[id] = best_gain;
-    T.left[id]  = grow_node_legacy(T, X, y, n, p, ws, lo, split, depth + 1, tp);
-    T.right[id] = grow_node_legacy(T, X, y, n, p, ws, split, hi, depth + 1, tp);
+
+    // Smaller child first, matching grow_node_full. The two growers pick splits
+    // identically but draw from one shared per-tree RNG stream, so recursing in
+    // different orders would make the node a given draw lands on depend on
+    // ws.hybrid_min -- a performance knob silently changing the fitted model.
+    const bool left_small = (split - lo) <= (hi - split);
+    const int64_t slo = left_small ? lo : split, shi = left_small ? split : hi;
+    const int64_t llo = left_small ? split : lo, lhi = left_small ? hi : split;
+    const int32_t id_small = grow_node_legacy(T, X, y, n, p, ws, slo, shi, depth + 1, tp);
+    const int32_t id_large = grow_node_legacy(T, X, y, n, p, ws, llo, lhi, depth + 1, tp);
+    T.left[id]  = left_small ? id_small : id_large;
+    T.right[id] = left_small ? id_large : id_small;
     return id;
 }
 
