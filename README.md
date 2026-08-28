@@ -2,9 +2,9 @@
 
 **Batch-boosted, holdout-pruned, sparsely re-weighted histogram trees, with a scikit-learn API.**
 
-SXE reaches LightGBM-level accuracy with models that are **1.5–2× smaller** on two of
-three benchmark tasks, and its predictions are **bit-identical regardless of how many
-threads you run it on**.
+Against a **tuned** LightGBM across nine datasets, SXE wins on accuracy on four and
+loses on five, with a smaller model on five (up to 11.8×). Its predictions are
+**bit-identical regardless of how many threads you run it on**.
 
 ```python
 from sklearn.datasets import fetch_california_housing
@@ -17,16 +17,17 @@ X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_
 model = SXERegressor(random_state=0).fit(X_train, y_train)
 preds = model.predict(X_test)
 print(model.summary())
-# {'n_iter': 120, 'n_trees_grown': 1200, 'n_trees_kept': 260, 'n_leaves': 8328,
-#  'model_size_mb': 0.186, 'tree_size_mb': 0.172, 'bin_table_mb': 0.014, ...}
+# {'n_iter': 120, 'n_trees_grown': 1200, 'n_trees_kept': 280, 'n_leaves': 8092,
+#  'model_size_mb': 0.18, 'tree_size_mb': 0.166, 'bin_table_mb': 0.014, ...}
 ```
 
 Those are the *default* parameters, not the tuned benchmark configuration — see
 [Tuning](#tuning).
 
-> **Status: alpha.** The API is not yet stable, and the published benchmarks are
-> five seeds on three datasets, one machine. See [Caveats](#caveats) before relying
-> on the headline numbers.
+> **Status: alpha.** The API is not yet stable, and the benchmarks are three to five
+> seeds on nine datasets, one machine. The defaults are the weakest part of the
+> package — they give up substantially more to tuning than LightGBM's do. See
+> [Caveats](#caveats) before relying on any of this.
 
 ## Install
 
@@ -62,7 +63,7 @@ caveats are in [TECHNICAL_REPORT.md](TECHNICAL_REPORT.md).
 
 | | |
 |---|---|
-| **Small models** | 1.5–2× fewer bytes than LightGBM at comparable accuracy on two of three tasks (and 12% *more* on the third), measured with the same compact-format accounting on both sides. Useful when the model ships to an edge device, into a container image, or through a serving path where load time matters. |
+| **Small models — sometimes** | Smaller than a tuned LightGBM on five of nine benchmark datasets, by up to 11.8×, and larger on the other four. Measured with the same accounting on both sides. Worth checking on your data if the model ships to an edge device, into a container image, or through a serving path where load time matters. |
 | **Reproducibility** | Per-tree RNG seeds derive from the tree index, never from scheduling order, so `n_jobs` is a pure performance knob: same seed, same predictions, bit for bit. This holds within a platform — the C++ standard library's random distributions are implementation-defined, so a seed grows different trees on Linux and macOS. |
 | **Parallel structure** | Trees within a batch are independent. Only the batch-level residual update is sequential, so growth parallelises where sequential GBDT cannot. |
 
@@ -75,8 +76,10 @@ caveats are in [TECHNICAL_REPORT.md](TECHNICAL_REPORT.md).
   it costs one full ensemble per class.
 - Regression and classification both minimise squared error. There is no
   logistic loss and no second-order (Newton) leaf values yet.
-- **The defaults are not yet tuned across a broad dataset suite.** The published
-  results use per-dataset configurations; see [Tuning](#tuning).
+- **The defaults give up more to tuning than LightGBM's do** — a median 9.5% error
+  reduction against 3.3%, on eight of nine datasets. Budget for a search, or wait
+  for better defaults; see [Tuning](#tuning).
+- **It is not on PyPI yet.** Install from a checkout until it is.
 
 ## API
 
@@ -127,9 +130,11 @@ model.n_iter_               # batches actually run before early stopping
 
 ## Tuning
 
-The defaults are a reasonable starting point but do **not** reproduce the
-benchmark table — those use per-dataset configurations in
-[`benchmarks/bench_final.py`](benchmarks/bench_final.py). Distilled guidance
+The defaults do **not** reproduce the benchmark table, and the gap is larger than
+it should be — see [The defaults are the weak point](#the-defaults-are-the-weak-point).
+The per-dataset configurations found by the random search are in
+[`benchmarks/tuned_configs.json`](benchmarks/tuned_configs.json); the search space
+is in [`benchmarks/bench_suite.py`](benchmarks/bench_suite.py). Distilled guidance
 from section 5 of the technical report:
 
 - **Smooth, low-dimensional signal**: fine trajectories. Small `learning_rate`,
@@ -142,55 +147,100 @@ from section 5 of the technical report:
   a large `learning_rate` with tight `n_iter_no_change`. This is where the
   speed comes from.
 
+Across all nine searches the same three moves recurred: **deeper trees** (not one
+winning configuration used the default `max_depth_choices`), **more batches**, and a
+**larger `batch_size`**. If you only turn three knobs, turn those.
+
 ## Benchmarks
 
-Mean ± sd over 5 seeds on one 10-core machine. LightGBM runs near defaults with
-early stopping, on the same number of training rows as SXE.
+Nine datasets, three to five seeds each, one 10-core machine. **Both libraries are
+tuned** by random search over a fixed space with the same number of draws — a win
+over a misconfigured baseline tells you nothing. Draw zero is each library's own
+defaults, so a tuned row can never be worse than its default row on the selection
+fold. **Size** uses one formula on both sides (13 bytes per internal node, 8 per
+leaf, plus the bin table a binned model needs to predict at all). **Time** is each
+library at its own best thread count.
 
-**Size** uses the same compact-format accounting on both sides — 13 bytes per
-internal node, 8 per leaf, plus the bin table — so the numbers are directly
-comparable. **Time** is each library at its own best thread count (LightGBM is
-fastest single-threaded at this data size; SXE is fastest on all cores).
+| Dataset | Metric | LightGBM | SXE | Size MB LGBM / SXE |
+|---|---|---|---|---|
+| california (20,640 × 8) | rmse ↓ | **0.4409 ± 0.0095** | 0.4480 ± 0.0097 | 2.845 / **0.241** |
+| friedman1 + noise (25,000 × 25) | rmse ↓ | 1.0695 ± 0.0112 | **1.0557 ± 0.0166** | 0.526 / 0.993 |
+| superconduct (21,263 × 81) | rmse ↓ | **9.3313 ± 0.3171** | 9.6685 ± 0.2807 | 5.766 / **1.253** |
+| covtype binary (30,000 × 54) | auc ↑ | 0.9547 ± 0.0031 | **0.9590 ± 0.0026** | 1.092 / 3.545 |
+| covtype full (581,012 × 54) | auc ↑ | **0.9977 ± 0.0001** | 0.9946 ± 0.0001 | 10.508 / 14.448 |
+| adult (48,842 × 14) | auc ↑ | **0.9305 ± 0.0016** | 0.9240 ± 0.0020 | 0.489 / **0.443** |
+| bank marketing (45,211 × 16) | auc ↑ | 0.9338 ± 0.0017 | **0.9354 ± 0.0021** | 0.202 / **0.181** |
+| letter, 26 classes (20,000 × 16) | accuracy ↑ | **0.9661 ± 0.0018** | 0.9629 ± 0.0003 | 5.109 / 13.564 |
+| madelon (2,600 × 500) | auc ↑ | 0.8873 ± 0.0089 | **0.9031 ± 0.0075** | 1.364 / **1.036** |
 
-| Dataset | Metric | LightGBM | SXE | Leaves LGBM / SXE | Size (MB) LGBM / SXE | Fit (s) LGBM / SXE |
-|---|---|---|---|---|---|---|
-| Covertype (binary, 30k subsample) | AUC ↑ | 0.9487 ± 0.0024 | **0.9521** ± 0.0034 | 57,908 / 69,113 | **1.302** / 1.470 | 1.97 / **0.58** |
-| Friedman1 + noise | RMSE ↓ | 1.0917 ± 0.0150 | **1.0860** ± 0.0170 | 10,614 / **6,055** | 0.269 / **0.174** | 0.72 / **0.18** |
-| California housing | RMSE ↓ | **0.4441** ± 0.0106 | 0.4480 ± 0.0097 | 22,729 / **10,831** | 0.484 / **0.241** | **0.57** / 1.41 |
+**Accuracy: four to SXE, five to LightGBM.** By paired seed differences, SXE's wins on
+covtype-binary (5.0 sd) and madelon (2.4 sd) are clear and LightGBM's on covtype-full
+(57.8 sd), adult (9.8 sd) and superconduct (3.1 sd) are clear; the rest are within
+seed-to-seed spread.
 
-Six of nine cells to SXE. Friedman1 is a clean sweep; Covertype is an accuracy
-and speed win but a size loss; California is a size win only. Raw output is in
-[`benchmarks/results.csv`](benchmarks/results.csv).
+The shape of it: SXE's randomization is variance reduction. It wins where variance
+dominates — noise, p ≫ n, many irrelevant features — and loses where bias dominates:
+large n, smooth strong signal, correlated informative features.
+
+**Size is not a systematic win against a tuned LightGBM.** SXE's model is smaller on
+five of nine and larger on four. Where it wins it wins big (11.8× on california, 4.6×
+on superconduct) because nothing in either search penalises size and LightGBM's drifts
+to very large models; where it loses, it loses on structure it genuinely spends.
+
+### The defaults are the weak point
+
+The gap between each library's tuned and default rows is the honest measure of "does
+this need tuning":
+
+| | SXE | LightGBM |
+|---|---|---|
+| Median error reduction from tuning | **9.5%** | 3.3% |
+| Datasets where tuning helps more | **8 of 9** | 1 of 9 |
+
+Not one of the nine winning SXE configurations used the default `max_depth_choices`,
+and `max_iter` and `batch_size` both selected the top of their search range on most
+datasets. The defaults build too small a model. Until that is fixed, read the SXE
+column above as what a *tuned* SXE does.
 
 Reproduce with:
 
 ```bash
 pip install -e ".[bench]"
-python benchmarks/bench_final.py            # 5 seeds, ~5 min
-python benchmarks/bench_final.py --seeds 0  # single seed, quick
+python benchmarks/bench_suite.py                  # everything, ~1.5 h
+python benchmarks/bench_suite.py -d adult letter  # a subset
+python benchmarks/bench_suite.py --seeds 0        # single seed, quick
 ```
+
+Raw output is in [`benchmarks/results_suite.csv`](benchmarks/results_suite.csv) and
+the selected configurations in
+[`benchmarks/tuned_configs.json`](benchmarks/tuned_configs.json).
 
 ## Caveats
 
 Read section 8 of the technical report before quoting any of this. In short:
 
-- **Tuning is asymmetric.** SXE was tuned per dataset; LightGBM ran near defaults
-  with early stopping. Read it as "a tuned SXE vs a well-defaulted LightGBM".
-- **Only one margin clears the noise.** Across seeds, SXE wins Covertype 5/5
-  (+0.0034 ± 0.0014 AUC). Friedman1 (4/5) and California (2/5) are both within
-  seed-to-seed spread.
-- **Three datasets, one machine.** Covertype is a 30,000-row subsample of
-  581,012; none of this transfers to the full dataset, where LightGBM scales
-  better. A broad multi-dataset sweep is the next piece of work.
+- **The defaults do not reproduce the table.** They give up a median 9.5% to tuning
+  against LightGBM's 3.3%. This is the largest gap between the method and a library
+  someone can pick up.
+- **Size is an outcome, not a controlled variable.** Both searches optimise accuracy
+  alone, so the size column reports where each search happened to land rather than
+  what either library can do under a size budget.
 - **Size is an estimate for both**, not a byte count of either library's real
-  serialization. LightGBM's actual format stores float thresholds and needs no
-  bin table, which the shared formula charges it for anyway.
+  serialization. LightGBM's format stores float thresholds and needs no bin table,
+  which the shared formula charges it for anyway. SXE's own `serialize()` currently
+  writes about 2.9× the compact estimate — that is a fixable defect in the format,
+  not in the accounting.
+- **Nine datasets, one machine.** Timings are wall-clock on a 10-core laptop and will
+  not transfer.
 - **Seeds are not portable across platforms.** The C++ standard library's random
-  distributions are implementation-defined, so the same seed grows different
-  trees under libstdc++, libc++ and MSVC. Within a platform, results are
-  bit-identical across runs and thread counts.
-- **`predict_proba` is uncalibrated.** Squared-error scores clipped into [0, 1];
-  fine for AUC, poor for log-loss.
+  distributions are implementation-defined, so the same seed grows different trees
+  under libstdc++, libc++ and MSVC. Within a platform, results are bit-identical
+  across runs, thread counts and `hybrid_min`.
+- **Categorical columns are ordinal-coded and missing values imputed** before either
+  library sees them, because SXE cannot take them otherwise. LightGBM run on raw NaNs
+  and declared categoricals scores within 0.0013 AUC of its imputed row on both
+  categorical datasets, so on this suite the workaround costs almost nothing — but
+  the user still has to do it.
 
 ## Repository layout
 
