@@ -1,0 +1,404 @@
+{
+  "adult/LightGBM": {
+    "params": {
+      "bagging_fraction": 0.8353122073468151,
+      "bagging_freq": 1,
+      "feature_fraction": 0.4745699658997384,
+      "lambda_l2": 0.3879341802770626,
+      "learning_rate": 0.02771473968728253,
+      "min_child_samples": 5,
+      "num_leaves": 46
+    },
+    "search_loss": -0.9305873389471164
+  },
+  "adult/SXE": {
+    "params": {
+      "batch_size": 16,
+      "learning_rate": 0.09025627522876077,
+      "max_depth_choices": [
+        0
+      ],
+      "max_features_range": [
+        0.5,
+        1.0
+      ],
+      "max_iter": 250,
+      "max_leaf_nodes": 127,
+      "min_samples_leaf_range": [
+        5,
+        30
+      ],
+      "n_iter_no_change": 8,
+      "n_thresholds": 2,
+      "prune_strength_range": [
+        0.01,
+        2.0
+      ],
+      "splitter": "random",
+      "subsample_range": [
+        0.9,
+        1.0
+      ],
+      "validation_fraction": 0.1
+    },
+    "search_loss": -0.922998462133517
+  },
+  "bank_marketing/LightGBM": {
+    "params": {
+      "bagging_fraction": 0.9066351196001362,
+      "bagging_freq": 1,
+      "feature_fraction": 0.4099165813171175,
+      "lambda_l2": 4.477363031844235,
+      "learning_rate": 0.08727093859002812,
+      "min_child_samples": 6,
+      "num_leaves": 25
+    },
+    "search_loss": -0.9465451132947766
+  },
+  "bank_marketing/SXE": {
+    "params": {
+      "batch_size": 12,
+      "learning_rate": 0.06905650599536747,
+      "max_depth_choices": [
+        0
+      ],
+      "max_features_range": [
+        0.5,
+        1.0
+      ],
+      "max_iter": 250,
+      "max_leaf_nodes": 127,
+      "min_samples_leaf_range": [
+        10,
+        60
+      ],
+      "n_iter_no_change": 20,
+      "n_thresholds": 2,
+      "prune_strength_range": [
+        0.01,
+        2.0
+      ],
+      "splitter": "best",
+      "subsample_range": [
+        0.5,
+        0.8
+      ],
+      "validation_fraction": 0.15
+    },
+    "search_loss": -0.9461467285280636
+  },
+  "california/LightGBM": {
+    "params": {
+      "bagging_fraction": 0.8101067260076888,
+      "bagging_freq": 1,
+      "feature_fraction": 0.6551371749094453,
+      "lambda_l2": 9.558418047801041,
+      "learning_rate": 0.04471883236309089,
+      "min_child_samples": 22,
+      "num_leaves": 424
+    },
+    "search_loss": 0.45677611569612336
+  },
+  "california/SXE": {
+    "params": {
+      "batch_size": 4,
+      "learning_rate": 0.05,
+      "max_depth_choices": [
+        0
+      ],
+      "max_features_range": [
+        0.85,
+        1.0
+      ],
+      "max_iter": 1200,
+      "max_leaf_nodes": 63,
+      "min_samples_leaf_range": [
+        10,
+        25
+      ],
+      "n_alphas": 15,
+      "n_iter_no_change": 25,
+      "prune_strength_range": [
+        0.001,
+        0.05
+      ],
+      "subsample_range": [
+        0.9,
+        1.0
+      ],
+      "validation_fraction": 0.15
+    },
+    "search_loss": 0.4671793561174316
+  },
+  "covtype_binary/LightGBM": {
+    "params": {
+      "bagging_fraction": 0.9079267770607661,
+      "bagging_freq": 1,
+      "feature_fraction": 0.9610434542726609,
+      "lambda_l2": 0.0010255432976732015,
+      "learning_rate": 0.07871809912482117,
+      "min_child_samples": 25,
+      "num_leaves": 166
+    },
+    "search_loss": -0.9504907193263358
+  },
+  "covtype_binary/SXE": {
+    "params": {
+      "batch_size": 16,
+      "bundle_binary_features": false,
+      "learning_rate": 0.2304404052668637,
+      "max_depth_choices": [
+        8,
+        10,
+        12
+      ],
+      "max_features_range": [
+        0.85,
+        1.0
+      ],
+      "max_iter": 250,
+      "min_samples_leaf_range": [
+        2,
+        15
+      ],
+      "n_iter_no_change": 3,
+      "n_thresholds": 3,
+      "prune_strength_range": [
+        0.001,
+        0.05
+      ],
+      "splitter": "random",
+      "subsample_range": [
+        0.9,
+        1.0
+      ],
+      "validation_fraction": 0.1
+    },
+    "search_loss": -0.9486554636383403
+  },
+  "covtype_full/LightGBM": {
+    "params": {
+      "bagging_fraction": 0.9079267770607661,
+      "bagging_freq": 1,
+      "feature_fraction": 0.9610434542726609,
+      "lambda_l2": 0.0010255432976732015,
+      "learning_rate": 0.07871809912482117,
+      "min_child_samples": 25,
+      "num_leaves": 166
+    },
+    "search_loss": -0.9975419226160134
+  },
+  "covtype_full/SXE": {
+    "params": {
+      "batch_size": 16,
+      "bundle_binary_features": false,
+      "learning_rate": 0.2304404052668637,
+      "max_depth_choices": [
+        8,
+        10,
+        12
+      ],
+      "max_features_range": [
+        0.85,
+        1.0
+      ],
+      "max_iter": 120,
+      "min_samples_leaf_range": [
+        2,
+        15
+      ],
+      "n_iter_no_change": 3,
+      "n_thresholds": 3,
+      "prune_strength_range": [
+        0.001,
+        0.05
+      ],
+      "splitter": "random",
+      "subsample_range": [
+        0.9,
+        1.0
+      ],
+      "validation_fraction": 0.1
+    },
+    "search_loss": -0.994271806838885
+  },
+  "friedman1_noise/LightGBM": {
+    "params": {
+      "bagging_fraction": 0.6294322965854662,
+      "bagging_freq": 1,
+      "feature_fraction": 0.7373391053370743,
+      "lambda_l2": 0.00926195904714575,
+      "learning_rate": 0.03225429753886065,
+      "min_child_samples": 90,
+      "num_leaves": 48
+    },
+    "search_loss": 1.0613015264213335
+  },
+  "friedman1_noise/SXE": {
+    "params": {
+      "batch_size": 16,
+      "learning_rate": 0.03116484324911338,
+      "max_depth_choices": [
+        8,
+        10,
+        12
+      ],
+      "max_features_range": [
+        0.85,
+        1.0
+      ],
+      "max_iter": 250,
+      "min_samples_leaf_range": [
+        20,
+        70
+      ],
+      "n_iter_no_change": 3,
+      "n_thresholds": 2,
+      "prune_strength_range": [
+        0.01,
+        2.0
+      ],
+      "splitter": "random",
+      "subsample_range": [
+        0.2,
+        0.35
+      ],
+      "validation_fraction": 0.18
+    },
+    "search_loss": 1.0566355084710992
+  },
+  "letter/LightGBM": {
+    "params": {
+      "bagging_fraction": 0.6153211044968737,
+      "bagging_freq": 1,
+      "feature_fraction": 0.8777945621723765,
+      "lambda_l2": 0.0016146753089889116,
+      "learning_rate": 0.03136791512658471,
+      "min_child_samples": 19,
+      "num_leaves": 15
+    },
+    "search_loss": -0.9716666666666667
+  },
+  "letter/SXE": {
+    "params": {
+      "batch_size": 16,
+      "learning_rate": 0.05452298318464204,
+      "max_depth_choices": [
+        10,
+        12,
+        14
+      ],
+      "max_features_range": [
+        0.5,
+        1.0
+      ],
+      "max_iter": 150,
+      "min_samples_leaf_range": [
+        2,
+        15
+      ],
+      "n_iter_no_change": 20,
+      "n_thresholds": 3,
+      "prune_strength_range": [
+        0.01,
+        2.0
+      ],
+      "splitter": "random",
+      "subsample_range": [
+        0.5,
+        0.8
+      ],
+      "validation_fraction": 0.1
+    },
+    "search_loss": -0.96875
+  },
+  "madelon/LightGBM": {
+    "params": {
+      "bagging_fraction": 0.8353122073468151,
+      "bagging_freq": 1,
+      "feature_fraction": 0.4745699658997384,
+      "lambda_l2": 0.3879341802770626,
+      "learning_rate": 0.02771473968728253,
+      "min_child_samples": 5,
+      "num_leaves": 46
+    },
+    "search_loss": -0.8910667324128863
+  },
+  "madelon/SXE": {
+    "params": {
+      "batch_size": 12,
+      "learning_rate": 0.06905650599536747,
+      "max_depth_choices": [
+        0
+      ],
+      "max_features_range": [
+        0.5,
+        1.0
+      ],
+      "max_iter": 250,
+      "max_leaf_nodes": 127,
+      "min_samples_leaf_range": [
+        10,
+        60
+      ],
+      "n_iter_no_change": 20,
+      "n_thresholds": 2,
+      "prune_strength_range": [
+        0.01,
+        2.0
+      ],
+      "splitter": "best",
+      "subsample_range": [
+        0.5,
+        0.8
+      ],
+      "validation_fraction": 0.15
+    },
+    "search_loss": -0.9099276791584484
+  },
+  "superconduct/LightGBM": {
+    "params": {
+      "bagging_fraction": 0.8145540757698546,
+      "bagging_freq": 1,
+      "feature_fraction": 0.46329716774213775,
+      "lambda_l2": 5.112322143469584,
+      "learning_rate": 0.01971099296465461,
+      "min_child_samples": 15,
+      "num_leaves": 402
+    },
+    "search_loss": 9.228117128226689
+  },
+  "superconduct/SXE": {
+    "params": {
+      "batch_size": 16,
+      "learning_rate": 0.05452298318464204,
+      "max_depth_choices": [
+        10,
+        12,
+        14
+      ],
+      "max_features_range": [
+        0.5,
+        1.0
+      ],
+      "max_iter": 250,
+      "min_samples_leaf_range": [
+        2,
+        15
+      ],
+      "n_iter_no_change": 20,
+      "n_thresholds": 3,
+      "prune_strength_range": [
+        0.01,
+        2.0
+      ],
+      "splitter": "random",
+      "subsample_range": [
+        0.5,
+        0.8
+      ],
+      "validation_fraction": 0.1
+    },
+    "search_loss": 9.941778225851744
+  }
+}
