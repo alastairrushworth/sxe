@@ -19,7 +19,10 @@ from .bundling import BinaryBundler
 __all__ = ["SXERegressor", "SXEClassifier"]
 
 # Compact serialized-size estimate: internal nodes carry (feat, thr, left,
-# right) = 13 bytes, leaves carry a single double.
+# right) = 13 bytes, leaves carry a single double. The bin table counts too --
+# the trees index bins, not feature values, so the quantile edges have to ship
+# with them or the model cannot predict. benchmarks/bench_final.py applies this
+# same accounting to every library it compares against.
 _BYTES_PER_INTERNAL = 13
 _BYTES_PER_LEAF = 8
 
@@ -117,7 +120,10 @@ class _BaseSXE(BaseEstimator):
     bundle_binary_features : bool, default=False
         Enable exclusive feature bundling for binary columns.
     hybrid_min : int, default=600
-        Node size above which the histogram-subtraction grower is used.
+        Node size above which the histogram-subtraction grower is used. This is
+        not purely a speed knob: the two growers recurse in different orders
+        (smaller-child-first vs left-first) and share one per-tree RNG stream,
+        so changing it changes which trees get grown, not just how fast.
     n_alphas : int, default=20
         Alphas in the weight-fit regularisation path.
     weight_cv : int, default=3
@@ -130,7 +136,10 @@ class _BaseSXE(BaseEstimator):
         of one core, and matches other gradient-boosting libraries.
     random_state : int, RandomState, Generator or None
         Seeds binning, the validation split, and per-tree randomisation.
-        Results are independent of ``n_jobs``.
+        Results are independent of ``n_jobs`` and reproduce bit-for-bit across
+        runs on one machine. They are *not* portable across platforms: the C++
+        standard library's random distributions are implementation-defined, so
+        libstdc++, libc++ and MSVC grow different trees from the same seed.
     verbose : int, default=0
         If non-zero, print a one-line fit summary.
     """
@@ -377,9 +386,11 @@ class _BaseSXE(BaseEstimator):
         self.n_trees_ = int(n_members)
         self.n_trees_kept_ = int(self.ensemble_.n_members)
         self.n_leaves_ = int(leaves)
-        self.model_size_bytes_ = int(
-            (nodes - leaves) * _BYTES_PER_INTERNAL + leaves * _BYTES_PER_LEAF
-        )
+        # kept separate so the one-vs-rest classifier can sum the trees across
+        # its sub-models without counting the shared bin table once per class
+        self.tree_bytes_ = int((nodes - leaves) * _BYTES_PER_INTERNAL + leaves * _BYTES_PER_LEAF)
+        self.bin_table_bytes_ = int(sum(e.nbytes for e in self.binner_.edges_))
+        self.model_size_bytes_ = self.tree_bytes_ + self.bin_table_bytes_
         self.fit_time_ = time.perf_counter() - t0
 
         if self.verbose:
@@ -426,7 +437,15 @@ class _BaseSXE(BaseEstimator):
         return g / total if total > 0 else g
 
     def summary(self) -> dict:
-        """Fit diagnostics: trees grown and kept, structure, size, timings."""
+        """Fit diagnostics: trees grown and kept, structure, size, timings.
+
+        ``model_size_mb`` is a compact-format estimate of everything that has
+        to ship to make a prediction: the tree structure (13 bytes per internal
+        node, 8 per leaf) plus the quantile bin table, broken out as
+        ``tree_size_mb`` and ``bin_table_mb``. It is not the size of a pickle
+        of this object, which carries per-node split gains and Python overhead
+        on top.
+        """
         check_is_fitted(self)
         return {
             "n_iter": self.n_iter_,
@@ -434,6 +453,8 @@ class _BaseSXE(BaseEstimator):
             "n_trees_kept": self.n_trees_kept_,
             "n_leaves": self.n_leaves_,
             "model_size_mb": round(self.model_size_bytes_ / 1e6, 3),
+            "tree_size_mb": round(self.tree_bytes_ / 1e6, 3),
+            "bin_table_mb": round(self.bin_table_bytes_ / 1e6, 3),
             "grow_time_s": round(self.grow_time_, 3),
             "weight_fit_time_s": round(self.weight_fit_time_, 3),
             "fit_time_s": round(self.fit_time_, 3),
@@ -542,7 +563,11 @@ class SXEClassifier(ClassifierMixin, _BaseSXE):
         self.n_trees_ = sum(s.n_trees_ for s in subs)
         self.n_trees_kept_ = sum(s.n_trees_kept_ for s in subs)
         self.n_leaves_ = sum(s.n_leaves_ for s in subs)
-        self.model_size_bytes_ = sum(s.model_size_bytes_ for s in subs)
+        # every sub-model bins the same X the same way, so the bin table is
+        # shared and must be counted once, not once per class
+        self.tree_bytes_ = sum(s.tree_bytes_ for s in subs)
+        self.bin_table_bytes_ = subs[0].bin_table_bytes_
+        self.model_size_bytes_ = self.tree_bytes_ + self.bin_table_bytes_
         self.grow_time_ = sum(s.grow_time_ for s in subs)
         self.weight_fit_time_ = sum(s.weight_fit_time_ for s in subs)
         self.fit_time_ = sum(s.fit_time_ for s in subs)

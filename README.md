@@ -2,22 +2,31 @@
 
 **Batch-boosted, holdout-pruned, sparsely re-weighted histogram trees, with a scikit-learn API.**
 
-SXE reaches LightGBM-level accuracy with models that are **5–20× smaller**, and its
-predictions are **bit-identical regardless of how many threads you run it on**.
+SXE reaches LightGBM-level accuracy with models that are **1.5–2× smaller** on two of
+three benchmark tasks, and its predictions are **bit-identical regardless of how many
+threads you run it on**.
 
 ```python
+from sklearn.datasets import fetch_california_housing
+from sklearn.model_selection import train_test_split
 from sxe import SXERegressor
+
+X, y = fetch_california_housing(return_X_y=True)
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=0)
 
 model = SXERegressor(random_state=0).fit(X_train, y_train)
 preds = model.predict(X_test)
 print(model.summary())
-# {'n_iter': 45, 'n_trees_grown': 720, 'n_trees_kept': 304, 'n_leaves': 6068,
-#  'model_size_mb': 0.123, ...}
+# {'n_iter': 120, 'n_trees_grown': 1200, 'n_trees_kept': 260, 'n_leaves': 8328,
+#  'model_size_mb': 0.186, 'tree_size_mb': 0.172, 'bin_table_mb': 0.014, ...}
 ```
 
+Those are the *default* parameters, not the tuned benchmark configuration — see
+[Tuning](#tuning).
+
 > **Status: alpha.** The API is not yet stable, and the published benchmarks are
-> single-seed on three datasets. See [Caveats](#caveats) before relying on the
-> headline numbers.
+> five seeds on three datasets, one machine. See [Caveats](#caveats) before relying
+> on the headline numbers.
 
 ## Install
 
@@ -53,8 +62,8 @@ caveats are in [TECHNICAL_REPORT.md](TECHNICAL_REPORT.md).
 
 | | |
 |---|---|
-| **Small models** | 5–20× fewer bytes than LightGBM at comparable accuracy. Useful when the model ships to an edge device, into a container image, or through a serving path where load time matters. |
-| **Reproducibility** | Per-tree RNG seeds derive from the tree index, never from scheduling order, so `n_jobs` is a pure performance knob. Same seed, same predictions, bit for bit. |
+| **Small models** | 1.5–2× fewer bytes than LightGBM at comparable accuracy on two of three tasks (and 12% *more* on the third), measured with the same compact-format accounting on both sides. Useful when the model ships to an edge device, into a container image, or through a serving path where load time matters. |
+| **Reproducibility** | Per-tree RNG seeds derive from the tree index, never from scheduling order, so `n_jobs` is a pure performance knob: same seed, same predictions, bit for bit. This holds within a platform — the C++ standard library's random distributions are implementation-defined, so a seed grows different trees on Linux and macOS. |
 | **Parallel structure** | Trees within a batch are independent. Only the batch-level residual update is sequential, so growth parallelises where sequential GBDT cannot. |
 
 ## Why you might not
@@ -135,29 +144,53 @@ from section 5 of the technical report:
 
 ## Benchmarks
 
-Single core, one fixed 80/20 split, one seed. LightGBM runs near defaults with
-early stopping. SXE sizes are a compact-format estimate; LightGBM sizes are
-pickled objects, so the leaf counts are the format-free comparison.
+Mean ± sd over 5 seeds on one 10-core machine. LightGBM runs near defaults with
+early stopping, on the same number of training rows as SXE.
 
-| Dataset | Metric | LightGBM | SXE | Leaves LGBM / SXE | Size (MB) LGBM / SXE |
-|---|---|---|---|---|---|
-| Covertype (binary) | AUC ↑ | 0.9499 | **0.9526** | 60,946 / 66,372 | 6.76 / **1.39** |
-| Friedman1 + noise | RMSE ↓ | 1.0945 | **1.0940** | 8,339 / **6,068** | 0.79 / **0.12** |
-| California housing | RMSE ↓ | **0.4333** | 0.4469 | 25,823 / **10,033** | 2.40 / **0.21** |
+**Size** uses the same compact-format accounting on both sides — 13 bytes per
+internal node, 8 per leaf, plus the bin table — so the numbers are directly
+comparable. **Time** is each library at its own best thread count (LightGBM is
+fastest single-threaded at this data size; SXE is fastest on all cores).
+
+| Dataset | Metric | LightGBM | SXE | Leaves LGBM / SXE | Size (MB) LGBM / SXE | Fit (s) LGBM / SXE |
+|---|---|---|---|---|---|---|
+| Covertype (binary, 30k subsample) | AUC ↑ | 0.9487 ± 0.0024 | **0.9521** ± 0.0034 | 57,908 / 69,113 | **1.302** / 1.470 | 1.97 / **0.58** |
+| Friedman1 + noise | RMSE ↓ | 1.0917 ± 0.0150 | **1.0860** ± 0.0170 | 10,614 / **6,055** | 0.269 / **0.174** | 0.72 / **0.18** |
+| California housing | RMSE ↓ | **0.4441** ± 0.0106 | 0.4480 ± 0.0097 | 22,729 / **10,831** | 0.484 / **0.241** | **0.57** / 1.41 |
+
+Six of nine cells to SXE. Friedman1 is a clean sweep; Covertype is an accuracy
+and speed win but a size loss; California is a size win only. Raw output is in
+[`benchmarks/results.csv`](benchmarks/results.csv).
 
 Reproduce with:
 
 ```bash
 pip install -e ".[bench]"
-python benchmarks/bench_final.py --n-jobs 1
+python benchmarks/bench_final.py            # 5 seeds, ~5 min
+python benchmarks/bench_final.py --seeds 0  # single seed, quick
 ```
 
 ## Caveats
 
 Read section 8 of the technical report before quoting any of this. In short:
-single seed, single split; SXE was tuned per dataset while LightGBM ran near
-defaults; model sizes mix a format estimate with pickles. Multi-seed,
-multi-dataset evaluation is the next piece of work.
+
+- **Tuning is asymmetric.** SXE was tuned per dataset; LightGBM ran near defaults
+  with early stopping. Read it as "a tuned SXE vs a well-defaulted LightGBM".
+- **Only one margin clears the noise.** Across seeds, SXE wins Covertype 5/5
+  (+0.0034 ± 0.0014 AUC). Friedman1 (4/5) and California (2/5) are both within
+  seed-to-seed spread.
+- **Three datasets, one machine.** Covertype is a 30,000-row subsample of
+  581,012; none of this transfers to the full dataset, where LightGBM scales
+  better. A broad multi-dataset sweep is the next piece of work.
+- **Size is an estimate for both**, not a byte count of either library's real
+  serialization. LightGBM's actual format stores float thresholds and needs no
+  bin table, which the shared formula charges it for anyway.
+- **Seeds are not portable across platforms.** The C++ standard library's random
+  distributions are implementation-defined, so the same seed grows different
+  trees under libstdc++, libc++ and MSVC. Within a platform, results are
+  bit-identical across runs and thread counts.
+- **`predict_proba` is uncalibrated.** Squared-error scores clipped into [0, 1];
+  fine for AUC, poor for log-loss.
 
 ## Repository layout
 

@@ -22,5 +22,5 @@ venv/
 .idea/
 .vscode/
 
-# benchmark output
-benchmarks/results.csv
+# benchmark output is committed: it is the provenance for the tables in
+# README.md and TECHNICAL_REPORT.md. Re-run bench_final.py to regenerate.
