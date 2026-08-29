@@ -86,7 +86,7 @@ Concrete, checkable targets rather than adjectives:
 | Tuning | The gap between SXE-default and SXE-tuned is smaller than the gap between LightGBM-default and LightGBM-tuned. That is the measurable form of "does not need tuning". |
 | Coverage | Fits data with missing values and categorical columns without the user pre-processing them. |
 | Reproducibility | Bit-identical across thread counts and speed knobs, on one platform, and this is tested rather than asserted. |
-| Trust | Every number in the README and the technical report traces to a committed CSV produced by a script in the repo. |
+| Trust | Every number in the README and the technical paper traces to a committed CSV produced by a script in the repo. |
 
 ## Open questions
 

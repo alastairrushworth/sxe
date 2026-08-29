@@ -23,4 +23,4 @@ venv/
 .vscode/
 
 # benchmark output is committed: it is the provenance for the tables in
-# README.md and TECHNICAL_REPORT.md. Re-run bench_final.py to regenerate.
+# README.md and paper/sxe.pdf. Re-run bench_final.py to regenerate.

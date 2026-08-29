@@ -1,7 +1,7 @@
 """Check the packaged core against the original ctypes prototype.
 
 The prototype in this directory is the implementation that produced the
-numbers in TECHNICAL_REPORT.md. The package is a port -- pybind11 instead of
+v1/v2 numbers in paper/sxe.pdf. The package is a port -- pybind11 instead of
 ctypes, a std::thread pool instead of OpenMP -- so it needs an oracle, and
 this is it: same seed, same splits, same configurations, and the predictions
 must come out bit-for-bit identical.

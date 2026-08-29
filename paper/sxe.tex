@@ -5,6 +5,7 @@
 \usepackage{lmodern}
 \usepackage{microtype}
 \usepackage[margin=1in]{geometry}
+\emergencystretch=3em
 \usepackage{amsmath,amssymb,amsthm}
 \usepackage{booktabs}
 \usepackage{multirow}
@@ -77,7 +78,7 @@ bias--variance trade-offs rather than committing to one. Second, after
 generation the whole trajectory is re-fitted by a single non-negative lasso
 over batch-average prediction columns on a held-out fold; most batches receive
 weight exactly zero and are physically deleted from the model. At the shipped
-defaults this discards roughly 73--79\% of the trees that were grown.
+defaults this discards 77--92\% of the trees that were grown.
 
 We give a complete description of the method and its implementation, and a
 head-to-head evaluation against a \emph{tuned} LightGBM on nine datasets with a
@@ -254,17 +255,20 @@ prune the bin table to the columns that survive.
 
 \subsection{Global quantile binning}\label{sec:binning}
 
-Every feature is quantile-binned once, up front, into at most 256 bins, and
-\emph{every} downstream stage --- split search, holdout routing, pruning,
-member prediction, the weight-fit design matrix --- operates on that single
-\code{uint8} matrix. There is no intermediate float matrix.
+Every feature is quantile-binned once, up front, and \emph{every} downstream
+stage --- split search, holdout routing, pruning, member prediction, the
+weight-fit design matrix --- operates on that single \code{uint8} matrix. There
+is no intermediate float matrix.
 
-Edges are estimated from a subsample of at most $50{,}000$ rows. For
-\code{max\_bins} $=256$ the code takes the interior points of
-$\text{linspace}(0,1,\cdot)$ as quantile levels, deduplicates the resulting
-edges (so a feature with few distinct values gets few bins), and maps values
-with \code{searchsorted(edges, x, side='right')}. The layout handed to the C++
-core is column-major, since the split search sweeps a feature at a time.
+\code{max\_bins} counts the bins available to finite values and is at most 255,
+following scikit-learn's \code{HistGradientBoosting*} vocabulary; the 256th bin
+is reserved for missing values and is not part of the budget. Edges are
+estimated from a subsample of at most $50{,}000$ rows: the code takes
+$\code{max\_bins}-1$ interior points of $\text{linspace}(0,1,\cdot)$ as quantile
+levels, deduplicates the resulting edges (so a feature with few distinct values
+gets few bins), and maps values with
+\code{searchsorted(edges, x, side='right')}. The layout handed to the C++ core
+is column-major, since the split search sweeps a feature at a time.
 
 Binning is not merely a speed device here. A uniform random threshold drawn on
 a binned feature is \emph{exactly} a random bin cut-point, so the
@@ -272,15 +276,26 @@ extremely-randomized split rule of Section~\ref{sec:growth} composes with
 binning without approximation --- unlike a random threshold on raw values,
 which binning would have to round.
 
-\paragraph{Missing values.} At the reference commit, non-finite input is
-rejected at \code{fit} and \code{predict} and the user must impute upstream.
-Work in the repository's working tree (Section~\ref{sec:inflight}) reserves bin
-255 for \code{NaN} and lets the finite values occupy bins $0..254$. That scheme
-needs no support at all in the tree code: bin 255 routes like any other bin, so
-missing values travel with the largest values by default, and a split at bin
-254 --- which the exact-cut scan will find whenever it pays --- separates them.
-It is weaker than LightGBM's learned default direction, which can send missing
-either way at every node, but it is free.
+\paragraph{Missing values.} \code{NaN} gets its own bin. At the default
+\code{max\_bins}$=255$ the finite values occupy bins $0..254$ and missing
+occupies 255, which needs no support in the tree code at all: bin 255 routes
+like any other. Missing therefore travels with the largest values by default,
+and a split at the top finite bin --- which the exact-cut scan finds whenever it
+pays --- separates it. Infinity is still rejected at
+\code{fit} and \code{predict}: \code{NaN} means missing, but infinity is a
+number the binning cannot place. An all-missing column gets no edges at all and
+every row lands in bin 255.
+
+This is weaker than LightGBM's learned default direction, which can send missing
+either way at every node, and the repository is explicit that it is a
+convenience feature rather than an accuracy feature. The evidence is mixed by
+design: on a synthetic problem where missingness \emph{is} the signal the scheme
+reaches 0.97 AUC, which no imputation can reach; but against median imputation
+at 10\% and 30\% missingness on four datasets it wins four of eight comparisons
+and loses four, with Covertype the clearest loss --- punching holes in binary
+indicator columns puts \code{NaN} above the positive class, where the median
+puts it with the negatives. The point is that the library stops refusing the
+data, not that it handles it better than the user would.
 
 \subsection{Exclusive feature bundling}\label{sec:efb}
 
@@ -351,7 +366,8 @@ $\text{depth}+1$ buffers are live per thread and they are pooled.
 Children below \code{hybrid\_min} fall back to a second grower that builds a
 single 256-bin histogram per candidate feature with touched-bin clearing, and
 so pays no $p\times256$ clearing cost on small nodes. The threshold trades one
-cost against the other.
+cost against the other; 600 was found to work across all three of the datasets
+it was tuned on and has not needed a per-dataset value since.
 
 \begin{observation}[\code{hybrid\_min} is a pure performance knob]
 Both growers select splits identically but draw from one shared per-tree random
@@ -364,11 +380,26 @@ asserting it.
 
 \paragraph{Leaf-wise growth.} Setting \code{max\_leaf\_nodes} switches to
 best-first growth in LightGBM's style: a max-heap keyed on gain holds pending
-leaves with their histograms and precomputed best splits, the highest-gain leaf
-is split, children are obtained by the same fill-smaller-and-subtract step, and
-growth stops at the leaf budget. Exported node ids satisfy
-$\text{parent} < \text{children}$ in both modes, which is what makes the
-bottom-up passes below valid without a separate traversal order.
+leaves, the highest-gain leaf is split, each child's best split is evaluated and
+pushed if it clears the depth, size and gain floors, and growth stops at the
+leaf budget. This is not a corner case --- the random search of
+Section~\ref{sec:tuninggap} selected it on four of nine datasets.
+
+A pending leaf carries only its best split, not the histogram that found it; the
+histogram is rebuilt when the leaf is popped and released immediately, so at
+most one is live per workspace. That gives up parent-minus-child subtraction for
+the children of a popped node, costing roughly one extra histogram fill per
+node, and it is nonetheless \emph{faster}: the alternative --- one retained
+\code{Hist} per pending leaf, at $p \times 256 \times 12$ bytes each --- made the
+workspace scale with the leaf budget rather than with depth, and its per-buffer
+reset \code{memset} dominated the fill it was saving. On $4000 \times 500$ data
+at \code{batch\_size}$=16$ the retained-histogram scheme reached 906\,MB peak RSS
+in 0.90\,s against 254\,MB in 0.62\,s for the rebuild scheme, and 304\,MB for
+depth-wise growth.
+
+Exported node ids satisfy $\text{parent} < \text{children}$ in both modes, which
+is what makes the bottom-up passes below valid without a separate traversal
+order.
 
 \paragraph{Per-tree randomization.} Every tree independently draws:
 \begin{center}
@@ -535,7 +566,9 @@ never returned to. This is ISLE \cite{friedman2003isle}.
 non-negative yields sparser and markedly more stable solutions than
 unconstrained least squares. It also prevents the pathology where two batches
 acquire large opposing weights that cancel: every retained batch must
-contribute in the direction it was fitted.
+contribute in the direction it was fitted. Note that the weights are
+\emph{not} additionally constrained to sum to one --- the fit is free to scale
+the ensemble, and the intercept absorbs whatever shared bias remains.
 
 \paragraph{Why on held-out data.} Selection is deliberately on the validation
 fold. Fitted in-sample, the deepest and least-pruned members would absorb
@@ -558,7 +591,14 @@ repairing the direction of the fit. Generation decides where each batch points;
 the lasso decides how much of it to keep, and whether to keep it at all.
 \end{observation}
 
-Measured at the reference defaults on two datasets (script in
+The prototype's earlier multi-round class (\code{CppSXE} in \code{reference/})
+retains a different schedule for the same fit --- full cross-validation on the
+first and last rounds, single warm fixed-$\alpha$ fits at $0.7\times$ the
+previous $\alpha$ in between, and a narrowed final grid
+$\alpha_1 \cdot \text{logspace}(0.5, -1, 10)$ --- which the one-shot fit
+described here replaced.
+
+Measured at the shipped defaults on two datasets (script in
 Section~\ref{sec:repro}):
 
 \begin{center}
@@ -566,11 +606,15 @@ Section~\ref{sec:repro}):
 \toprule
 Dataset & Batches run & Trees grown & Trees kept & Kept \\
 \midrule
-California housing & 120 & 1{,}200 & 250 & 20.8\% \\
-Friedman1 + noise & 104 & 1{,}040 & 280 & 26.9\% \\
+California housing & 300 & 4{,}800 & 368 & 7.7\% \\
+Friedman1 + noise & 155 & 2{,}480 & 560 & 22.6\% \\
 \bottomrule
 \end{tabular}
 \end{center}
+
+\noindent The California figure is not an accident of that dataset: the defaults
+budget 300 batches and early stopping never fires, so the generator runs its full
+course and the lasso then discards 92\% of what it built.
 
 \subsection{Prediction, classification and calibration}\label{sec:predict}
 
@@ -587,7 +631,11 @@ by giving every observation both labels with weights $t$ and $1-t$, so an
 ordinary logistic solver optimises the smoothed objective exactly. If the fold
 cannot identify a calibration --- one class only, a constant score, or a fitted
 map that is non-increasing --- the calibrator is dropped and the raw score is
-clipped instead, so a bad fit can never reorder the scores.
+clipped to $[10^{-6}, 1-10^{-6}]$ instead, so a bad fit can never reorder the
+scores. Under the one-vs-rest reduction this decision is made for all classes
+together: a rare class whose validation fold contains no positives cannot be
+calibrated, and mapping the others while clipping that one would normalise a row
+across two different scales.
 
 Multiclass is one-vs-rest: one complete ensemble per class, with per-class
 scores normalised to sum to one. This is a reduction, not a native objective,
@@ -625,14 +673,36 @@ this as an open decision.
 
 Two distinct quantities must be kept apart.
 
-\paragraph{The portable accounting formula.} For comparing libraries, size is
-computed identically for both sides from the tree structure alone: 13 bytes per
-internal node (feature 4, threshold 1, left 4, right 4), 8 bytes per leaf
-(value), plus the bin table a binned model needs to map raw features to bins at
-predict time ($255$ edges $\times$ 8 bytes per feature the model indexes).
-Trees are full binary, so internal nodes $=$ leaves $-$ trees. This formula is
-used in Section~\ref{sec:results} for both \SXE\ and LightGBM precisely because
-it special-cases neither.
+An earlier version of this comparison set an \SXE\ format estimate against
+\emph{pickled} baselines, which overstated the difference by two to five times;
+that claim was withdrawn, and the rule below is what replaced it.
+
+\paragraph{The portable accounting formula.} For comparing tree structure, size
+is computed identically for both sides: 13 bytes per internal node (feature 4,
+threshold 1, left 4, right 4), 8 bytes per leaf (value), plus a full 255-edge
+float64 bin table per input feature. Trees are full binary, so internal nodes
+$=$ leaves $-$ trees. This is the column reported in Section~\ref{sec:results},
+and it special-cases neither library --- but it compares \emph{structure} and
+nothing else, and it is a poor guide to what either library would ship. It
+charges LightGBM for a bin table its format does not need, and it charges both
+sides for edges that deduplicate away on low-cardinality data or are never
+indexed on wide data. The repository measures \SXE's real bin table at 1.9\,kB
+on Letter where the formula charges 32.6\,kB, and at 67\,kB on Madelon where the
+formula charges 1.02\,MB.
+
+\paragraph{A second, less flattering column.} The benchmark script has since
+been extended to record a \code{real\_bytes} column alongside the portable one:
+measured for \SXE\ (\code{model\_size\_bytes\_}, the bytes \code{serialize()}
+writes plus the quantile edges of the columns the trees actually index), and for
+LightGBM the smallest sensible encoding of what its trees need --- a float64
+threshold rather than a bin id, an explicit left child, and no bin table, at 20
+bytes per internal node. That assumption is generous to LightGBM, whose real
+files also carry split gains and node counts. It is nonetheless \emph{less}
+favourable to \SXE\ than the portable formula: on Madelon LightGBM's real model
+is the smaller one, which the portable column hid behind a bin table neither
+library actually pays. The committed results predate this change, so
+Section~\ref{sec:results} reports the portable column throughout and
+Section~\ref{sec:limitations} carries the consequence.
 
 \paragraph{The format \SXE\ actually writes.} \code{Ensemble::serialize} stores
 only what prediction reads. Three fields that a naive layout would store are
@@ -649,29 +719,32 @@ What remains is 9 bytes per internal node, 8 per leaf, and one bit per node
 recording which is which. The bin table is additionally pruned to the columns
 the retained trees actually index; on Madelon at defaults the model splits on
 61 of 500 features and was carrying 421\,kB of quantile edges for the other
-439.
+439. Unused columns transform to bin 0, which is safe precisely because nothing
+reads them, and a one-vs-rest classifier shares a single table across its
+sub-models covering the union of the columns they use, rather than each
+sub-model holding a pruned copy of the same edges.
 
 An earlier version of this format wrote 29 bytes per node --- storing
 \code{gain} everywhere, \code{feat}/\code{thr}/\code{left}/\code{right} on
 leaves and \code{val} on internal nodes --- so the advertised size was
 $2.9\times$ smaller than the artefact. That has been corrected. Measured at the
-reference defaults:
+shipped defaults:
 
 \begin{center}
 \begin{tabular}{lrrr}
 \toprule
 Dataset & \code{serialize()} & Portable formula & Ratio \\
 \midrule
-California housing & 138{,}195 B & 161{,}495 B & $0.86\times$ \\
-Friedman1 + noise & 247{,}861 B & 294{,}224 B & $0.84\times$ \\
+California housing & 472{,}757 B & 565{,}618 B & $0.84\times$ \\
+Friedman1 + noise & 1{,}279{,}555 B & 1{,}542{,}667 B & $0.83\times$ \\
 \bottomrule
 \end{tabular}
 \end{center}
 
-\noindent The real format is now \emph{smaller} than the portable formula the
-benchmark charges it, so the size column of Section~\ref{sec:results} is
-conservative for \SXE\ on the structure term. It remains a formula rather than
-a byte count for LightGBM.
+\noindent \SXE's real tree format is therefore \emph{below} the portable
+formula the benchmark charges it. Its bin-table charge runs the other way, and
+by more, so the two errors do not cancel and neither sign can be claimed for the
+size column as a whole.
 
 \subsection{Complexity}\label{sec:complexity}
 
@@ -695,7 +768,10 @@ Weight fit & $O(n_{\text{val}} M_b^2)$ Gram, then coordinate descent on $M_b \ti
 
 The $O(n_s p)$ term in growth is dominated by the smaller-child histogram fills,
 which sum to at most $n_s p / 2$ per level because the larger child is always
-obtained by subtraction. Measured single-core grower throughput on Covertype
+obtained by subtraction. Histogram memory is $O(\text{depth})$ per thread in
+depth-wise growth --- at most $\text{depth}+1$ pooled buffers live --- and
+$O(1)$, a single live buffer, in leaf-wise growth; neither scales with the leaf
+budget or the tree count. Measured single-core grower throughput on Covertype
 was $\approx 27.8$k leaves/s against LightGBM's $\approx 13.9$k, so wall-clock
 differences between the libraries come from \emph{how much structure each
 method builds}, not from per-leaf cost.
@@ -723,6 +799,29 @@ The division of labour is deliberate: everything that runs once per fit and is
 cheap (binning, bundling, the train/validation split, the lasso) stays in
 Python where scikit-learn's implementations are already good; everything that
 runs once per tree or once per row is in C++.
+
+The prototype under \code{reference/} is not installed and is retained for two
+purposes: as the source of the v1/v2 ablation figures in
+Section~\ref{sec:results}, and as a parity oracle --- the packaged core
+reproduces it bit-for-bit. It holds \code{sxe.cpp} (the original C API core with
+OpenMP, including the v2 multi-round \code{sxe\_grow}), \code{cpp\_sxe.py} (a
+ctypes wrapper exposing \code{CppSXE} for v2 and \code{CppSXEBoost} for v3),
+\code{sparse\_extra.py} (the pure-Python v1 prototype built on scikit-learn's
+\code{ExtraTreeRegressor} with cost-complexity-path variants), the v1/v2
+benchmark scripts, and \code{results\_v3.csv}.
+
+\subsection{Build}
+
+The package builds with scikit-build-core and pybind11 and needs a C++17
+compiler and CMake from source; at runtime it needs only NumPy ($\ge 1.22$) and
+scikit-learn ($\ge 1.3$) on Python $\ge 3.9$, with \code{lightgbm} required only
+by the benchmark scripts. Continuous integration builds and tests wheels for
+five platforms across CPython 3.9--3.13.
+
+Optimisation flags are deliberately portable: \code{-march=native} measured no
+reproducible speedup on these datasets, which is consistent with the
+memory-bound histogram loops of Section~\ref{sec:complexity}, so wheels give it
+up for nothing.
 
 \subsection{Threading}
 
@@ -762,6 +861,8 @@ Nine datasets, chosen so that each stresses a different property --- including
 several that stress properties \SXE\ does not have.
 
 \begin{center}
+\small
+\setlength{\tabcolsep}{4pt}
 \begin{tabular}{llll}
 \toprule
 Dataset & Shape & Task & What it tests \\
@@ -791,8 +892,10 @@ over a fixed space with the same number of draws (10--24, larger where a fit is
 cheap). Draw zero is always the library's own defaults, so a tuned row cannot
 be worse than its default row on the selection fold. The search runs once per
 dataset on seed 0 and the selected configuration is reused across seeds, so
-neither library tunes against a seed it is scored on. Selected configurations
-are committed to \code{benchmarks/tuned\_configs.json}.
+neither library tunes against a seed it is scored on. The hand-tuned
+configurations from the ablation history (Section~\ref{sec:results}) are entered
+as additional warm starts. Selected configurations are committed to
+\code{benchmarks/tuned\_configs.json}.
 
 \paragraph{Common preprocessing.} Both libraries receive the same matrix:
 categorical columns ordinal-coded, numeric missing values median-imputed from
@@ -829,6 +932,7 @@ time is the mean at each library's best thread count.
 \small
 \caption{Both libraries tuned. Mean $\pm$ standard deviation across seeds.
 Bold marks the better mean.}
+\setlength{\tabcolsep}{4pt}
 \begin{tabular}{llccrrrr}
 \toprule
 & & \multicolumn{2}{c}{Accuracy} & \multicolumn{2}{c}{Size (MB)} & \multicolumn{2}{c}{Best fit (s)} \\
@@ -851,6 +955,14 @@ Madelon         & auc $\uparrow$    & 0.8873 $\pm$ 0.0089 & \textbf{0.9031} $\pm
 \noindent
 \textbf{Accuracy: four to \SXE, five to LightGBM. Size: five to \SXE, four to
 LightGBM. Time: three to \SXE, six to LightGBM.} No axis is a systematic win.
+
+The timing column deserves one note about what it is not. Reported this way ---
+each library at its own best thread count --- speed goes to \SXE\ on three of
+nine. At the setting a user is actually likely to choose, all cores for both,
+\SXE\ would win most of them, because LightGBM's within-tree parallelism costs
+it on data this size. That framing is available and is declined here: a library
+compared against itself at its worst configuration is the same error as a tuned
+model compared against an untuned baseline.
 
 \subsection{Paired analysis}
 
@@ -902,6 +1014,17 @@ loses on size it loses on structure it genuinely spends: 164k leaves on
 Covertype-30k, and 650k on Letter, where the one-vs-rest reduction pays for 26
 separate ensembles.
 
+One caution on reading these numbers by proxy: leaf count is not a format-free
+stand-in for size. The two libraries put different amounts of information in a
+node and a leaf, and \SXE\ additionally carries a bin table that LightGBM does
+not, so a leaf-count ratio and a byte ratio can point in different directions.
+
+The five--four split is also specific to the portable accounting. Under the
+real-format column of Section~\ref{sec:size} the Madelon verdict reverses,
+because the portable formula charges both libraries for a 500-feature bin table
+that \SXE\ prunes to 61 columns and LightGBM never needs at all. Read the size
+column as a structure comparison, which is what it is.
+
 \subsection{What tuning buys each library}\label{sec:tuninggap}
 
 The gap between a library's tuned and default rows is the measurable form of
@@ -950,6 +1073,13 @@ ran into the ceiling of the search space, which means the defaults are not
 merely mistuned but \emph{systematically build too small a model}, and the true
 optimum lies beyond what was searched.
 
+Those defaults have since been revised in exactly that direction
+(Section~\ref{sec:inflight}), recovering a median 58\% of the per-dataset
+tuning gain on six datasets re-checked, at roughly $4\times$ the fit time and
+2--3.5$\times$ the model size. The table above is measured at the previous
+settings and is left as the diagnosis that motivated the change; what the
+revision is worth across the whole suite is a question for the next full run.
+
 \subsection{What the missing features cost}
 
 \begin{center}
@@ -963,6 +1093,15 @@ Bank marketing & 0.9338 auc & 0.9351 auc & $+0.0013$ \\
 \end{tabular}
 \end{center}
 
+\paragraph{RandomForest context.} For scale, the v1-era measurements against
+scikit-learn's \code{RandomForest} (single seed, prototype, not re-run):
+California 0.511 RMSE in 33.8\,s, Friedman1 1.443 RMSE in 116\,s, Covertype
+0.9486 AUC in 11.5\,s. Every version of \SXE\ from v1 onward beats those on
+both accuracy and time by wide margins, which is the floor the method clears
+rather than a competitive comparison. The v1-era model sizes were pickled
+scikit-learn objects and are not comparable to the size column above.
+
+\medskip
 Native categorical handling and native missing-value handling buy LightGBM
 almost nothing on these two datasets. \SXE's gap on Adult ($-0.0065$ AUC) is
 therefore a \emph{model} gap, not an encoding gap --- a useful negative result,
@@ -986,26 +1125,37 @@ Change & Effect \\
 Multi-round boosting vs.\ a single-round dictionary
 & The single-round dictionary lands at random-forest level; the residual rounds
 supply essentially all accuracy beyond bagging. Boosted multi-round beat RF
-everywhere (Friedman 1.088 vs.\ 1.443 RMSE) at 20--40$\times$ smaller models. \\
+everywhere (Friedman 1.088 vs.\ 1.443 RMSE) at 20--40$\times$ smaller models;
+LightGBM matched it only on the noisy task. \\
 \addlinespace
 Holdout pruning replacing a cost-complexity approximation
 & Covertype AUC $0.9480 \to 0.9528$, alongside 5--10$\times$ faster growth from
-the move to C++. Consistent with pruning decisions made against genuinely
-held-out data. \\
+the move to C++, and a $6\times$ cut in the weight fit from precomputing the
+Gram matrix. Consistent with pruning decisions made against genuinely held-out
+data. \\
 \addlinespace
 Histogram subtraction
 & $\approx 1.6\times$ on growth. \\
 \addlinespace
 Exclusive feature bundling
-& A further $\approx 2.4\times$ on Covertype at unchanged accuracy. \\
+& A further $\approx 2.4\times$ on Covertype at unchanged accuracy. Profiling at
+this stage showed the grower already producing $\approx 2\times$ more leaves/s
+than LightGBM, so the remaining wall-clock gap was structure volume and pipeline
+overhead rather than per-leaf cost. Covertype became a clean three-axis win;
+Friedman was accuracy-tied but slow, because the dictionary was a fixed size
+where LightGBM early-stopped; California plateaued near 0.47 RMSE. \\
 \addlinespace
 Batch boosting + batch-group lasso (v2 $\to$ v3)
-& Friedman flipped to a win on all three axes. Per-member lasso columns cost
+& Friedman flipped to a win on all three axes --- a 0.9-second grower and a
+0.12\,MB model. Per-member lasso columns cost
 $\approx 7$\,s at thousands of columns; batch columns made the fit
-0.02--0.3\,s with no accuracy change. \\
+0.02--0.3\,s with no accuracy change. The shallow-tree defaults broke Covertype
+outright (AUC 0.92), recovered only by depth 10--14 with random cuts: that
+dataset genuinely needs deep, wide-candidate trees, and it was the first clear
+sign of the defaults problem of Section~\ref{sec:tuninggap}. \\
 \addlinespace
-The small-holdout guard (Obs.~\ref{obs:guard})
-& California $0.4504 \to 0.4437$ RMSE. \\
+Small-holdout guard
+& Observation~\ref{obs:guard}. California $0.4504 \to 0.4437$ RMSE. \\
 \addlinespace
 Leaf-wise growth
 & Did not break the California accuracy plateau (63 leaves $\approx$ depth-wise
@@ -1091,24 +1241,32 @@ Stated at the strength the evidence supports.
 
 \paragraph{The defaults are not the method.} Section~\ref{sec:tuninggap} is the
 dominant caveat. Everything in the \SXE\ column of Table~\ref{tab:paired} is a
-tuned \SXE. A user's first fit gives up a median 9.5\% error reduction. Until
-the defaults are fixed, the honest description of the package is ``competitive
-after a search''.
+tuned \SXE, and at the settings those results were measured under, a user's
+first fit gave up a median 9.5\% error reduction. The defaults have since been
+revised and recover a median 58\% of that on the datasets re-checked
+(Section~\ref{sec:inflight}), but the revision has not been measured across the
+whole suite, so the honest description of the package remains ``competitive
+after a search, and better out of the box than these tables show''.
 
 \paragraph{Size is an outcome, not a controlled variable.} Both searches
-optimise accuracy alone. Neither column answers the question the use case
-actually poses --- \emph{what accuracy is available under a size budget} ---
-and answering it would require the search to record every draw's size, which it
-does not.
+optimise accuracy alone, so a single tuned point per library cannot answer the
+question the use case actually poses --- \emph{what accuracy is available if the
+model has to fit in $N$ megabytes}. The search has since been instrumented to
+record every draw's (loss, size) pair, which answers it at no extra cost, but
+the results reported here predate that and report only where an accuracy-driven
+search happened to land.
 
-\paragraph{Size is a formula for LightGBM.} The portable accounting is applied
-identically to both sides, which is the right call for comparison, but it is
-not a byte count of LightGBM's real serialization. LightGBM's format stores
-float thresholds and needs no bin table, which the shared formula charges it
-for anyway. \SXE's own format is now measurably \emph{below} the formula
-(Section~\ref{sec:size}), so the shared rule is conservative for \SXE\ and
-somewhat harsh on LightGBM. A comparison of actual on-disk artefacts would be
-better and has not been done.
+\paragraph{The size column compares structure, not artefacts.} The portable
+accounting is applied identically to both sides, which is the right call for
+comparing tree structure, but it is a byte count of neither library. It charges
+LightGBM for a bin table its format does not need, and it charges both sides for
+quantile edges that deduplicate away or are never indexed --- \SXE's real bin
+table is 1.9\,kB on Letter against the formula's 32.6\,kB. The net effect is not
+uniformly in \SXE's favour: its own tree format is measurably \emph{below} the
+formula (Section~\ref{sec:size}), but its bin-table charge is far above what it
+ships, and under the real-format accounting the Madelon size verdict reverses.
+The correct reading is that structure is compared fairly and shipped size is
+not yet compared at all.
 
 \paragraph{Nine datasets, one machine.} Timings are wall-clock on a 10-core
 laptop and will not transfer. Three seeds on the two most expensive datasets is
@@ -1122,13 +1280,17 @@ platform, and is tested. It does not hold across C++ standard libraries
 \paragraph{Method limits.} Squared error throughout; no logistic loss; no
 second-order leaf values. Multiclass is a one-vs-rest reduction costing one
 ensemble per class --- on Letter, 26 ensembles, 650k leaves and $2.7\times$
-LightGBM's model for slightly worse accuracy. Features are capped at 256 bins.
-There is no general categorical handling beyond binary bundling.
+LightGBM's model for slightly worse accuracy. Features are capped at 255 finite
+bins plus the missing bin. There is no general categorical handling beyond
+binary bundling, and no \code{sample\_weight}.
 
 \paragraph{Preprocessing was done for the benchmark.} Categoricals were
 ordinal-coded and missing values imputed before either library saw them.
 Section~\ref{sec:results} prices what that costs in accuracy --- almost nothing
-on this suite --- but not what it costs in user effort, which is real.
+on this suite --- but not what it costs in user effort, which is real. \SXE\ now
+takes \code{NaN} directly (Section~\ref{sec:binning}), so of that burden only
+the categorical encoding remains; the benchmark predates the change and imputed
+for both libraries anyway, which keeps the comparison model-against-model.
 
 \paragraph{Concurrency.} Concurrent \code{fit} calls on a single estimator
 instance are unsupported, as they are for scikit-learn estimators generally.
@@ -1224,26 +1386,46 @@ all candidates reduce to gather and histogram kernels with no sort or argmax
 over raw values, and the weight fit is one small GEMM plus coordinate descent.
 \end{enumerate}
 
-\subsection{Work in flight}\label{sec:inflight}
+\subsection{Changes landed since the benchmark run}\label{sec:inflight}
 
-At the time of writing, the repository's working tree carries two uncommitted
-changes not reflected in the results above.
+Four changes have landed since the results of Section~\ref{sec:results} were
+measured. None of them alters the method; two of them change what a user gets,
+and the committed benchmark output predates all four.
 
-\emph{Missing-value support.} \code{NaN} is assigned bin 255 and finite values
-occupy $0..254$, as described in Section~\ref{sec:binning}; infinity is still
-rejected, since it is a number the binning cannot place. The estimator's
-\code{allow\_nan} tag flips accordingly and a dedicated test module covers it.
-This removes the preprocessing burden priced in Section~\ref{sec:results}
-without changing the tree code at all.
+\emph{Missing-value support}, as described in Section~\ref{sec:binning}. This
+removes the preprocessing burden priced in Section~\ref{sec:results} ---
+though, as that section shows, the preprocessing was costing accuracy almost
+nothing, so what it removes is user effort.
 
 \emph{A defaults revision.} \code{learning\_rate} $0.15 \to 0.07$,
 \code{max\_iter} $120 \to 300$, \code{batch\_size} $10 \to 16$,
 \code{n\_iter\_no\_change} $8 \to 15$, and \code{max\_depth\_choices}
-$(4,5,6,7,8) \to (6,8,10,12)$ --- a direct response to
-Section~\ref{sec:tuninggap}, moving all three of the identified knobs the way
-the tuned configurations pointed. Whether it closes the gap is a question for
-the full suite; per the project's own rule, a default change is a product
-decision measured across the whole benchmark, not on one dataset.
+$(4,5,6,7,8) \to (6,8,10,12)$ --- one configuration derived from the pattern in
+Section~\ref{sec:tuninggap} rather than tuned per dataset, moving all three of
+the identified knobs the way the tuned configurations pointed. On six datasets
+re-checked it improves every one and recovers a median 58\% of the per-dataset
+tuning gain. It is not free: fits take roughly $4\times$ longer and default
+models are 2--3.5$\times$ larger, which trades directly against the size claim.
+That is the right trade while default accuracy is the larger gap, and the five
+parameters can be set back. A full re-run of the suite is what would settle it;
+per the project's own rule, a default change is a product decision measured
+across the whole benchmark, not on one dataset.
+
+\emph{The dual size accounting} of Section~\ref{sec:size}, together with a
+record of every tuning draw's (loss, size) pair in \code{tuning\_draws.csv}, so
+the size-budget question of Section~\ref{sec:limitations} becomes answerable on
+the next full run.
+
+\emph{Two benchmark-protocol changes.} Covertype-full is now timed at all cores
+only, as Letter already was --- a single-threaded fit at the new defaults on
+465k rows runs to ten minutes, and the thread sweep would dominate the suite for
+a comparison nobody would make at that size --- and the \SXE\ search cap rises
+from 120 to 200 batches so sampled draws are not held below the default
+trajectory length.
+
+\emph{A leaf-wise memory fix} (Section~\ref{sec:growth}) and a publishing path:
+a \code{v*} tag now pushes wheels to PyPI by trusted publishing, though the
+package is not yet installable from PyPI.
 
 \section{Reproduction}\label{sec:repro}
 
@@ -1258,24 +1440,35 @@ python benchmarks/bench_suite.py --retune         # redo both random searches
 python -m pytest tests/                           # 105 tests
 \end{lstlisting}
 
-Raw output lands in \code{benchmarks/results\_suite.csv} and selected
-configurations in \code{benchmarks/tuned\_configs.json}; both are committed as
+Raw output lands in \code{benchmarks/}\allowbreak\code{results\_suite.csv} and
+selected configurations in
+\code{benchmarks/}\allowbreak\code{tuned\_configs.json}; both are committed as
 the provenance for every table in Section~\ref{sec:results}. Datasets download
 via scikit-learn; Friedman1 is synthetic with a fixed seed. Figures reproduce
 exactly only on the same C++ standard library
 (Section~\ref{sec:determinism}).
 
 The compression and serialized-size measurements in
-Sections~\ref{sec:weights} and~\ref{sec:size} were taken at the reference
-defaults with:
+Sections~\ref{sec:weights} and~\ref{sec:size} were taken at the shipped defaults
+with:
 
 \begin{lstlisting}[language=Python]
-HEAD = dict(learning_rate=0.15, max_iter=120, batch_size=10,
-            n_iter_no_change=8, max_depth_choices=(4, 5, 6, 7, 8))
-m = SXERegressor(random_state=0, **HEAD).fit(X, y)
+m = SXERegressor(random_state=0).fit(X, y)
 nodes, leaves = m.ensemble_.structure(m._members)
-blob     = len(m.ensemble_.serialize())
+blob     = len(m.ensemble_.serialize())   # == m.tree_bytes_
 portable = (nodes - leaves) * 13 + leaves * 8
+\end{lstlisting}
+
+\noindent The prototype benchmarks in \code{reference/} still run from a
+checkout, and are the source of the v1/v2 figures in
+Section~\ref{sec:results}:
+
+\begin{lstlisting}[language=bash]
+cd reference
+g++ -O3 -march=native -fopenmp -shared -fPIC sxe.cpp -o libsxe.so
+python benchmark.py        # v1: RandomForest + LightGBM baselines + Python SXE
+python cpp_benchmark.py    # v2: multi-round C++ SXE
+python parity_check.py     # the packaged core against the prototype
 \end{lstlisting}
 
 \section{Conclusion}
@@ -1407,47 +1600,53 @@ random forests.
 
 \section{Parameter reference}\label{app:params}
 
-Defaults as at the reference commit. Parameters follow scikit-learn's
-\code{HistGradientBoosting*} vocabulary where the concepts match.
+Shipped defaults. Parameters follow scikit-learn's
+\code{HistGradientBoosting*} vocabulary where the concepts match; the third
+column gives the name used by the prototype in \code{reference/}, for reading
+that code. The five values marked $\dagger$ were revised after the benchmark run
+(Section~\ref{sec:inflight}); the results of Section~\ref{sec:results} were
+measured at the previous settings, shown in brackets.
 
 \begin{center}
-\small
-\begin{tabular}{lll}
+\footnotesize
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{lllp{0.36\textwidth}}
 \toprule
-Parameter & Default & Meaning \\
+Parameter & Default & Prototype & Meaning \\
 \midrule
-\multicolumn{3}{l}{\emph{Boosting trajectory}} \\
-\code{learning\_rate} & \code{0.15} & $\nu$, shrinkage on each batch-average correction \\
-\code{max\_iter} & \code{120} & maximum boosting batches \\
-\code{batch\_size} & \code{10} & trees grown in parallel per batch \\
-\code{n\_iter\_no\_change} & \code{8} & early-stopping patience, in batches \\
-\code{tol} & \code{1e-4} & improvement threshold, in units of $\Var(y_{\text{val}})$ \\
-\code{validation\_fraction} & \code{0.18} & fold for early stopping, weights and calibration \\
+\multicolumn{4}{l}{\emph{Boosting trajectory}} \\
+\code{learning\_rate} & \code{0.07}$^\dagger$ \small[0.15] & \code{shrink} & $\nu$, shrinkage on each batch-average correction \\
+\code{max\_iter} & \code{300}$^\dagger$ \small[120] & \code{max\_batches} & maximum boosting batches \\
+\code{batch\_size} & \code{16}$^\dagger$ \small[10] & \code{batch} & trees grown in parallel per batch \\
+\code{n\_iter\_no\_change} & \code{15}$^\dagger$ \small[8] & \code{patience} & early-stopping patience, in batches \\
+\code{tol} & \code{1e-4} & --- & improvement threshold, in units of $\Var(y_{\text{val}})$ \\
+\code{validation\_fraction} & \code{0.18} & \code{val\_fraction} & fold for early stopping, weights and calibration \\
 \addlinespace
-\multicolumn{3}{l}{\emph{Per-tree randomization}} \\
-\code{max\_depth\_choices} & \code{(4,5,6,7,8)} & depth sampled uniformly; \code{0} $\Rightarrow$ 64 \\
-\code{min\_samples\_leaf\_range} & \code{(10, 60)} & log-uniform per tree \\
-\code{max\_features\_range} & \code{(0.5, 1.0)} & candidate-feature fraction, uniform per tree \\
-\code{subsample\_range} & \code{(0.4, 0.75)} & row subsample; the complement is the pruning holdout \\
-\code{prune\_strength\_range} & \code{(1e-3, 1.0)} & $\lambda$, log-uniform per tree \\
+\multicolumn{4}{l}{\emph{Per-tree randomization}} \\
+\code{max\_depth\_choices} & \code{(6,8,10,12)}$^\dagger$ & \code{depth\_choices} & depth sampled uniformly; \code{0} $\Rightarrow$ 64 \\
+& \small[(4,5,6,7,8)] & & \\
+\code{min\_samples\_leaf\_range} & \code{(10, 60)} & \code{leaf\_range} & log-uniform per tree \\
+\code{max\_features\_range} & \code{(0.5, 1.0)} & \code{feat\_range} & candidate-feature fraction, uniform per tree \\
+\code{subsample\_range} & \code{(0.4, 0.75)} & --- & row subsample; complement is the pruning holdout \\
+\code{prune\_strength\_range} & \code{(1e-3, 1.0)} & \code{lam\_range} & $\lambda$, log-uniform per tree \\
 \addlinespace
-\multicolumn{3}{l}{\emph{Tree construction}} \\
-\code{splitter} & \code{"best"} & exact bin scan, or \code{"random"} cut-points \\
-\code{n\_thresholds} & \code{2} & random cut-points per feature when \code{splitter="random"} \\
-\code{max\_leaf\_nodes} & \code{None} & if set, leaf-wise growth with this budget \\
-\code{max\_bins} & \code{256} & quantile bins per feature \\
-\code{bundle\_binary\_features} & \code{False} & exclusive feature bundling for binary columns \\
-\code{hybrid\_min} & \code{600} & node size above which subtraction is used (speed only) \\
+\multicolumn{4}{l}{\emph{Tree construction}} \\
+\code{splitter} & \code{"best"} & \code{argmax\_bins} & exact bin scan, or \code{"random"} cut-points \\
+\code{n\_thresholds} & \code{2} & \code{n\_thresh} & random cut-points when \code{splitter="random"} \\
+\code{max\_leaf\_nodes} & \code{None} & \code{max\_leaves} & if set, leaf-wise growth with this budget \\
+\code{max\_bins} & \code{255} & \code{n\_bins} & bins for finite values; a 256th holds missing \\
+\code{bundle\_binary\_features} & \code{False} & \code{bundle\_binary} & exclusive feature bundling for binary columns \\
+\code{hybrid\_min} & \code{600} & --- & node size above which subtraction is used (speed only) \\
 \addlinespace
-\multicolumn{3}{l}{\emph{Weight fit and output}} \\
-\code{l1\_ratio} & \code{1.0} & \code{1.0} is a pure lasso \\
-\code{n\_alphas} & \code{20} & regularisation path length \\
-\code{weight\_cv} & \code{3} & folds for choosing $\alpha$ \\
-\code{calibrate} & \code{"sigmoid"} & Platt scaling of \code{predict\_proba}; \code{None} clips instead \\
+\multicolumn{4}{l}{\emph{Weight fit and output}} \\
+\code{l1\_ratio} & \code{1.0} & \code{l1\_ratios} & \code{1.0} is a pure lasso \\
+\code{n\_alphas} & \code{20} & \code{n\_alphas} & regularisation path length \\
+\code{weight\_cv} & \code{3} & \code{cv} & folds for choosing $\alpha$ \\
+\code{calibrate} & \code{"sigmoid"} & --- & Platt scaling; \code{None} clips to $[10^{-6}, 1-10^{-6}]$ \\
 \addlinespace
-\multicolumn{3}{l}{\emph{Execution}} \\
-\code{n\_jobs} & \code{None} & threads; \code{None} $\Rightarrow$ all cores. Does not affect the model \\
-\code{random\_state} & \code{None} & seeds binning, the split, and per-tree randomization \\
+\multicolumn{4}{l}{\emph{Execution}} \\
+\code{n\_jobs} & \code{None} & --- & threads; \code{None} $\Rightarrow$ all cores. Does not affect the model \\
+\code{random\_state} & \code{None} & --- & seeds binning, the split, and per-tree randomization \\
 \bottomrule
 \end{tabular}
 \end{center}
@@ -1462,9 +1661,9 @@ and no winning configuration used the default depth choices.
 \item[Smooth, low-dimensional signal.] Fine trajectories: small
 \code{learning\_rate}, many batches, small \code{batch\_size}, mild subsampling
 (0.85--1.0), \code{splitter="best"}, \code{max\_leaf\_nodes} $\approx 63$.
-\item[High-dimensional or one-hot data.] \code{max\_depth\_choices=(10,12,14)},
-\code{splitter="random"} with \code{n\_thresholds=3},
-\code{bundle\_binary\_features=True}, moderate subsampling.
+\item[High-dimensional or one-hot data.] \code{max\_depth\_choices = (10,
+12, 14)}, \code{splitter = "random"} with \code{n\_thresholds = 3},
+\code{bundle\_binary\_features = True}, moderate subsampling.
 \item[Noisy data with irrelevant features.] Aggressive subsampling (0.2--0.4)
 and a large \code{learning\_rate} with tight \code{n\_iter\_no\_change}. This is
 also where the speed comes from.

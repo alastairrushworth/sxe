@@ -1,2 +1,5 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# the compiled paper must never be line-ending normalised
+*.pdf binary
