@@ -123,3 +123,26 @@ def test_degenerate_fold_falls_back_rather_than_reordering():
     assert _fit_platt(np.zeros(50), np.r_[np.zeros(25), np.ones(25)]) is None  # constant score
     a, _ = _fit_platt(s, (s > 0.5).astype(float))
     assert a > 0  # and a usable fold gives an increasing map
+
+
+def test_multiclass_calibration_is_all_or_nothing():
+    """A rare class can leave its fold with no positives and nothing to fit.
+
+    Mixing a sigmoid-mapped column with a raw clipped one puts the classes on
+    different scales before the row is normalised, so the model calibrates
+    every class or none of them.
+    """
+    X, y = make_classification(
+        n_samples=900,
+        n_features=8,
+        n_informative=5,
+        n_classes=4,
+        n_clusters_per_class=1,
+        weights=[0.94, 0.03, 0.02, 0.01],
+        random_state=3,
+    )
+    m = SXEClassifier(random_state=0, max_iter=10, batch_size=4).fit(X, y)
+    fitted = [s.calibrator_ is not None for s in m.estimators_]
+    assert all(fitted) or not any(fitted)
+    p = m.predict_proba(X)
+    assert np.allclose(p.sum(axis=1), 1.0)

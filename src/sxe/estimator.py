@@ -667,9 +667,12 @@ class SXEClassifier(ClassifierMixin, _CalibratesBinary, _BaseSXE):
             raise ValueError(f"SXEClassifier needs at least 2 classes, got 1 class: {classes[0]!r}")
 
         if len(classes) == 2:
+            # cleared first: _compact sums over estimators_ when there are any,
+            # and refitting a multiclass model on binary data would otherwise
+            # size the new model from the previous fit's sub-models
+            self.estimators_ = None
             self._fit(X, (y == classes[1]).astype(np.float64))
             self._compact(self.used_features_)
-            self.estimators_ = None
         else:
             params = self.get_params()
             estimators = []
@@ -703,6 +706,15 @@ class SXEClassifier(ClassifierMixin, _CalibratesBinary, _BaseSXE):
         for sub in subs:
             sub.binner_ = self.binner_
         self._compact(self.used_features_)
+
+        # All classes calibrated or none. A rare class can leave its validation
+        # fold with no positives, and Platt scaling has nothing to fit; mixing
+        # a sigmoid-mapped column with a raw clipped one and then normalising
+        # the row would put the classes on different scales.
+        self.calibrator_ = None
+        if any(s.calibrator_ is None for s in subs):
+            for sub in subs:
+                sub.calibrator_ = None
         self.grow_time_ = sum(s.grow_time_ for s in subs)
         self.weight_fit_time_ = sum(s.weight_fit_time_ for s in subs)
         self.fit_time_ = sum(s.fit_time_ for s in subs)

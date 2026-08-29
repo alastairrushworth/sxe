@@ -103,3 +103,17 @@ def test_cross_val_score(multiclass_data):
     X, y = multiclass_data
     scores = cross_val_score(SXEClassifier(random_state=0, **CFG), X, y, cv=3)
     assert np.isfinite(scores).all()
+
+
+def test_refit_from_multiclass_to_binary_clears_state(multiclass_data):
+    """estimators_ from a previous fit must not survive into the next one."""
+    X, y = multiclass_data
+    model = SXEClassifier(random_state=0, **CFG).fit(X, y)
+    assert model.estimators_ is not None
+    multi_size = model.model_size_bytes_
+
+    model.fit(X, (y == y[0]).astype(int))
+    assert model.estimators_ is None
+    assert len(model.classes_) == 2
+    assert model.model_size_bytes_ < multi_size
+    assert model.tree_bytes_ == len(model.ensemble_.serialize())
