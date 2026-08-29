@@ -533,7 +533,7 @@ def selection_loss(task, model, X, y):
     return -accuracy_score(y, model.predict(X))
 
 
-def fitted_size(library, model, n_features):
+def fitted_size(library, model):
     """Bytes the fitted model would ship, in each library's own format."""
     if library == "SXE":
         return int(model.model_size_bytes_)
@@ -564,7 +564,7 @@ def tune(library, task, Xtr, ytr, seed, budget, cap, n_binary, warm=(), record=N
         try:
             model, fit_s = fitter(task, params, Xa, ya, Xb, yb, seed, -1)
             loss = selection_loss(task, model, Xb, yb)
-            size = fitted_size(library, model, Xa.shape[1])
+            size = fitted_size(library, model)
         except Exception as exc:  # a pathological draw, e.g. num_leaves > rows
             print(f"    {library} [{i + 1}/{len(draws)}] skipped: {type(exc).__name__}", flush=True)
             continue
@@ -704,6 +704,31 @@ def write_csv(rows, out):
     print(f"\nwrote {out}")
 
 
+def prepare(loader, seed):
+    """One dataset at one seed: split, encode, impute, and describe."""
+    X_raw, y, task, cat_idx = loader(seed)
+    X_enc = encode(X_raw, cat_idx)
+    strat = y if task != "regression" else None
+    Xtr_r, Xte_r, ytr, yte = train_test_split(
+        X_enc, y, test_size=0.2, random_state=seed, stratify=strat
+    )
+    Xtr, Xte = impute(Xtr_r, Xte_r)
+    return dict(
+        task=task,
+        cat_idx=cat_idx,
+        Xtr=Xtr,
+        Xte=Xte,
+        Xtr_raw=Xtr_r,
+        Xte_raw=Xte_r,
+        ytr=ytr,
+        yte=yte,
+        n=len(X_enc),
+        p=X_enc.shape[1],
+        n_missing=int((~np.isfinite(Xtr_r)).sum()),
+        n_binary=int(sum(len(np.unique(Xtr[:, j])) == 2 for j in range(Xtr.shape[1]))),
+    )
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("-d", "--datasets", nargs="*", default=list(DATASETS), choices=list(DATASETS))
@@ -728,86 +753,102 @@ def main():
         seeds = args.seeds if args.seeds is not None else list(range(spec["seeds"]))
         budget = args.budget if args.budget is not None else spec["budget"]
         threads = args.n_jobs if args.n_jobs is not None else spec["threads"]
+        splits = {seeds[0]: prepare(loader, seeds[0])}
+
+        # The search runs ONCE per dataset, on the first seed's split, and the
+        # winner is reused for every seed. Searching per seed would tune each
+        # model on the very split it is then scored on.
+        d0 = splits[seeds[0]]
+        for library in args.libraries:
+            key = f"{name}/{library}"
+            if not (args.retune or key not in tuned):
+                continue
+            print(f"\n### tuning {library} on {name} ({budget} draws) ###", flush=True)
+            # draw zero is always the library's own defaults, so a "tuned" row
+            # can never be worse than its "default" row on the selection fold;
+            # the hand-tuned configs from the original report join it where
+            # they exist
+            warm = [{}]
+            if library == "SXE" and name in TUNED_SXE:
+                warm.append(TUNED_SXE[name])
+            first = len(draws)
+            params, loss = tune(
+                library,
+                d0["task"],
+                d0["Xtr"],
+                d0["ytr"],
+                seeds[0],
+                budget,
+                cap,
+                d0["n_binary"],
+                warm,
+                draws,
+            )
+            for d in draws[first:]:
+                d["dataset"] = name
+            tuned[key] = {"params": params, "search_loss": loss}
+            tuned_path.write_text(json.dumps(tuned, indent=2, sort_keys=True, default=list))
 
         for seed in seeds:
-            X_raw, y, task, cat_idx = loader(seed)
-            X_enc = encode(X_raw, cat_idx)
-            strat = y if task != "regression" else None
-            Xtr_r, Xte_r, ytr, yte = train_test_split(
-                X_enc, y, test_size=0.2, random_state=seed, stratify=strat
-            )
-            Xtr, Xte = impute(Xtr_r, Xte_r)
-            n_missing = int((~np.isfinite(Xtr_r)).sum())
-            n_binary = int(sum(len(np.unique(Xtr[:, j])) == 2 for j in range(Xtr.shape[1])))
-
-            # The search runs once per dataset, on seed 0's split, and is
-            # reused for every seed. Re-searching per seed would let each
-            # library peek at each test split through its own tuning.
-            for library in args.libraries:
-                key = f"{name}/{library}"
-                if args.retune or key not in tuned:
-                    print(f"\n### tuning {library} on {name} ({budget} draws) ###", flush=True)
-                    # draw zero is always the library's own defaults, so a
-                    # "tuned" row can never be worse than its "default" row on
-                    # the selection fold; the hand-tuned configs from the
-                    # original report join it where they exist
-                    warm = [{}]
-                    if library == "SXE" and name in TUNED_SXE:
-                        warm.append(TUNED_SXE[name])
-                    params, loss = tune(
-                        library, task, Xtr, ytr, 0, budget, cap, n_binary, warm, draws
-                    )
-                    for d in draws[len(draws) - budget - len(warm) :]:
-                        d.setdefault("dataset", name)
-                    tuned[key] = {"params": params, "search_loss": loss}
-                    tuned_path.write_text(json.dumps(tuned, indent=2, sort_keys=True, default=list))
-
+            d = splits.pop(seed, None) or prepare(loader, seed)
             for n_jobs in threads:
                 print(
-                    f"\n=== {name} ({task}, n={len(X_enc)}, p={X_enc.shape[1]}, "
-                    f"cats={len(cat_idx)}, binary={n_binary}, missing={n_missing}) "
-                    f"seed={seed} n_jobs={n_jobs} ===\n    {note}",
+                    f"\n=== {name} ({d['task']}, n={d['n']}, p={d['p']}, "
+                    f"cats={len(d['cat_idx'])}, binary={d['n_binary']}, "
+                    f"missing={d['n_missing']}) seed={seed} n_jobs={n_jobs} ===\n    {note}",
                     flush=True,
                 )
                 runs = []
                 for library in args.libraries:
                     params = tuned[f"{name}/{library}"]["params"]
-                    runs.append(run_model(library, task, Xtr, ytr, Xte, yte, params, n_jobs, seed))
                     runs.append(
                         run_model(
                             library,
-                            task,
-                            Xtr,
-                            ytr,
-                            Xte,
-                            yte,
+                            d["task"],
+                            d["Xtr"],
+                            d["ytr"],
+                            d["Xte"],
+                            d["yte"],
+                            params,
+                            n_jobs,
+                            seed,
+                        )
+                    )
+                    runs.append(
+                        run_model(
+                            library,
+                            d["task"],
+                            d["Xtr"],
+                            d["ytr"],
+                            d["Xte"],
+                            d["yte"],
                             {},
                             n_jobs,
                             seed,
                             tag=f"{library}-default",
                         )
                     )
-                    if library == "LightGBM" and (cat_idx or n_missing):
+                    if library == "LightGBM" and (d["cat_idx"] or d["n_missing"]):
                         # LightGBM as it would actually be used on this data:
                         # declared categoricals and raw NaNs, no imputation.
-                        # The gap to the row above prices SXE's missing features.
+                        # The gap to the row above prices SXE's preprocessing.
                         runs.append(
                             run_model(
                                 library,
-                                task,
-                                Xtr_r,
-                                ytr,
-                                Xte_r,
-                                yte,
+                                d["task"],
+                                d["Xtr_raw"],
+                                d["ytr"],
+                                d["Xte_raw"],
+                                d["yte"],
                                 params,
                                 n_jobs,
                                 seed,
-                                cat_idx=cat_idx,
+                                cat_idx=d["cat_idx"],
                                 tag="LightGBM-native",
                             )
                         )
                 for r in runs:
-                    r.update(dataset=name, task=task, seed=seed, n_jobs=n_jobs)
+                    r.update(dataset=name, task=d["task"], seed=seed, n_jobs=n_jobs)
                     print(
                         f"  {r['model']:<18} {r['metric']} {r['value']:.4f}  "
                         f"{r['metric2']} {r['value2']:.4f}  {r['fit_s']:7.2f}s  "

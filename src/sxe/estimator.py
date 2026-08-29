@@ -266,6 +266,8 @@ class _BaseSXE(BaseEstimator):
                 raise ValueError(f"{name} lower bound must be >= {lo_min}, got {v!r}")
             return lo, hi
 
+        if self.calibrate not in (None, "sigmoid"):
+            raise ValueError(f"calibrate must be 'sigmoid' or None, got {self.calibrate!r}")
         if self.learning_rate <= 0:
             raise ValueError(f"learning_rate must be > 0, got {self.learning_rate}")
         if self.max_iter < 1:
@@ -456,9 +458,15 @@ class _BaseSXE(BaseEstimator):
         self.used_features_ = np.asarray(
             self.ensemble_.used_features(self._members, n_model_features), dtype=bool
         )
-        self._compact(self.used_features_)
+        # Compaction is deliberately not done here. restrict() can only remove
+        # edges, so a one-vs-rest classifier whose sub-models compacted
+        # individually could never build the shared table its union needs --
+        # every public fit() calls _compact once, with the right mask.
         self.fit_time_ = time.perf_counter() - t0
 
+        return self
+
+    def _report(self):
         if self.verbose:
             print(
                 f"SXE: {self.n_iter_} batches, kept {self.n_trees_kept_}/{self.n_trees_} trees, "
@@ -475,7 +483,9 @@ class _BaseSXE(BaseEstimator):
         estimate of a format SXE does not implement.
         """
         self.binner_.restrict(used)
-        self.tree_bytes_ = int(self.ensemble_.serialized_size())
+        subs = getattr(self, "estimators_", None)
+        trees = subs if subs else [self]
+        self.tree_bytes_ = int(sum(m.ensemble_.serialized_size() for m in trees))
         self.bin_table_bytes_ = int(sum(e.nbytes for e in self.binner_.edges_))
         self.model_size_bytes_ = self.tree_bytes_ + self.bin_table_bytes_
 
@@ -574,7 +584,9 @@ class SXERegressor(RegressorMixin, _BaseSXE):
     def fit(self, X, y):
         X, y = _validate(self, X, y, dtype=np.float64, y_numeric=True, ensure_2d=True)
         y = np.asarray(y, dtype=np.float64)
-        return self._fit(X, y)
+        self._fit(X, y)
+        self._compact(self.used_features_)
+        return self._report()
 
     def predict(self, X):
         return self._raw_predict(X)
@@ -590,8 +602,6 @@ class _CalibratesBinary:
     def _fit_calibrator(self, Xval, y_val, n_jobs):
         if self.calibrate is None:
             return None
-        if self.calibrate != "sigmoid":
-            raise ValueError(f"calibrate must be 'sigmoid' or None, got {self.calibrate!r}")
         # The fold is the one already carved for early stopping and the weight
         # fit, so the calibration is mildly optimistic on it. Carving a fourth,
         # dedicated fold costs more accuracy (less data to grow on) than the
@@ -620,7 +630,12 @@ class _BinaryCore(_CalibratesBinary, _BaseSXE):
     def fit(self, X, y):
         X = np.asarray(X, dtype=np.float64)
         self.n_features_in_ = X.shape[1]
-        return self._fit(X, np.asarray(y, dtype=np.float64))
+        self._fit(X, np.asarray(y, dtype=np.float64))
+        # SXEClassifier drives the multiclass path through _fit and compacts
+        # once over the union; this is here so a sub-model fitted on its own is
+        # not left without a size or a pruned bin table.
+        self._compact(self.used_features_)
+        return self
 
 
 class SXEClassifier(ClassifierMixin, _CalibratesBinary, _BaseSXE):
@@ -653,6 +668,7 @@ class SXEClassifier(ClassifierMixin, _CalibratesBinary, _BaseSXE):
 
         if len(classes) == 2:
             self._fit(X, (y == classes[1]).astype(np.float64))
+            self._compact(self.used_features_)
             self.estimators_ = None
         else:
             params = self.get_params()
@@ -665,7 +681,7 @@ class SXEClassifier(ClassifierMixin, _CalibratesBinary, _BaseSXE):
             self.estimators_ = estimators
             self._aggregate_multiclass()
         self.classes_ = classes
-        return self
+        return self._report()
 
     def _aggregate_multiclass(self):
         """Roll the per-class sub-models up into the usual fitted attributes."""
@@ -679,19 +695,14 @@ class SXEClassifier(ClassifierMixin, _CalibratesBinary, _BaseSXE):
         self.bundler_ = subs[0].bundler_
 
         # Every sub-model binned the same X with the same seed, so their edges
-        # are identical and one table can serve all of them -- but each pruned
-        # its own copy to its own columns, so the shared table has to cover the
-        # union. Sharing the object, rather than counting one and storing many,
-        # is what makes the reported size the size.
+        # are identical and one table can serve all of them -- but it has to
+        # carry every column ANY of them splits on, which is why no sub-model
+        # compacted its own copy first: restrict() only removes.
         self.used_features_ = np.logical_or.reduce([s.used_features_ for s in subs])
         self.binner_ = subs[0].binner_
-        self.binner_.restrict(self.used_features_)
         for sub in subs:
             sub.binner_ = self.binner_
-
-        self.tree_bytes_ = sum(s.tree_bytes_ for s in subs)
-        self.bin_table_bytes_ = int(sum(e.nbytes for e in self.binner_.edges_))
-        self.model_size_bytes_ = self.tree_bytes_ + self.bin_table_bytes_
+        self._compact(self.used_features_)
         self.grow_time_ = sum(s.grow_time_ for s in subs)
         self.weight_fit_time_ = sum(s.weight_fit_time_ for s in subs)
         self.fit_time_ = sum(s.fit_time_ for s in subs)

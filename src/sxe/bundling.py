@@ -82,7 +82,14 @@ class BinaryBundler:
         if k:
             out[:, :k] = np.asarray(X[:, self.passthrough_], dtype=np.float64)
         for i, cols in enumerate(self.bundles_):
-            sub = np.asarray(X[:, cols], dtype=np.float64) != 0.0
+            raw = np.asarray(X[:, cols], dtype=np.float64)
+            # A bundled column was strictly 0/1 during fit but can still arrive
+            # missing later. NaN is not an active member -- it is an unknown
+            # one -- so the bundle as a whole becomes missing and the binner
+            # sends it to its own bin.
+            unknown = np.isnan(raw)
+            sub = (raw != 0.0) & ~unknown
+
             # Exclusivity is verified on the training data and assumed here.
             # Silently encoding a conflicting row as its first active member
             # would make it indistinguishable from a row where only that
@@ -99,7 +106,9 @@ class BinaryBundler:
                     f"together. Refit with bundle_binary_features=False, or drop "
                     f"the conflicting rows."
                 )
-            out[:, k + i] = np.where(active > 0, sub.argmax(axis=1) + 1, 0)
+            col = np.where(active > 0, sub.argmax(axis=1) + 1, 0).astype(np.float64)
+            col[unknown.any(axis=1)] = np.nan
+            out[:, k + i] = col
         return out
 
     def unbundle(self, values):

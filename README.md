@@ -69,9 +69,12 @@ caveats are in [TECHNICAL_REPORT.md](TECHNICAL_REPORT.md).
 
 ## Why you might not
 
-- No missing-value support. NaN and infinity are rejected at `fit` and `predict`
-  rather than silently imputed — impute upstream.
+- Missing values are handled — NaN gets its own bin — but nothing learns a
+  per-split default direction, and against median imputation the two are within
+  noise. Treat it as convenience, not accuracy. Infinity is still rejected: NaN
+  means missing, infinity is a number the binning cannot place.
 - No categorical handling beyond exclusive feature bundling for binary columns.
+- No `sample_weight`.
 - Multiclass is one-vs-rest over the binary core, not a native multiclass loss:
   it costs one full ensemble per class.
 - Regression and classification both minimise squared error. There is no
@@ -237,11 +240,13 @@ Read section 8 of the technical report before quoting any of this. In short:
   distributions are implementation-defined, so the same seed grows different trees
   under libstdc++, libc++ and MSVC. Within a platform, results are bit-identical
   across runs, thread counts and `hybrid_min`.
-- **Categorical columns are ordinal-coded and missing values imputed** before either
-  library sees them, because SXE cannot take them otherwise. LightGBM run on raw NaNs
-  and declared categoricals scores within 0.0013 AUC of its imputed row on both
-  categorical datasets, so on this suite the workaround costs almost nothing — but
-  the user still has to do it.
+- **Categorical columns are ordinal-coded** before either library sees them, so the
+  comparison is model against model rather than preprocessing against preprocessing.
+  LightGBM run on declared categoricals instead scores within 0.0013 AUC of its shared-
+  matrix row on both categorical datasets. Missingness is encoded as its own category
+  level, so after encoding none of the nine datasets has a NaN left — the missing-value
+  path is measured separately by
+  [`benchmarks/bench_missing.py`](benchmarks/bench_missing.py).
 
 ## Repository layout
 

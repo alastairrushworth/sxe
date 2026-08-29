@@ -154,16 +154,41 @@ def test_pruned_bin_table_does_not_change_predictions(fitted_reg):
 
 
 def test_multiclass_shares_one_bin_table():
-    """One table for all classes, covering the union of the columns they use."""
+    """One table for all classes, covering the union of the columns they use.
+
+    The sub-models split on different features, so a table pruned to any one
+    class silently zeroes columns the others rely on. Wide data with a small
+    candidate-feature fraction is what makes the sets diverge -- with p=10 they
+    all use everything and the bug hides.
+    """
+    from sxe.binning import QuantileBinner
+
     X, y = make_classification(
-        n_samples=900,
-        n_features=10,
-        n_informative=6,
-        n_classes=3,
+        n_samples=1500,
+        n_features=120,
+        n_informative=40,
+        n_classes=4,
         n_clusters_per_class=1,
         random_state=0,
     )
-    model = SXEClassifier(random_state=0, **CFG).fit(X, y)
+    cfg = dict(
+        random_state=0,
+        max_iter=6,
+        batch_size=4,
+        max_depth_choices=(3,),
+        max_features_range=(0.1, 0.2),
+    )
+    model = SXEClassifier(**cfg).fit(X, y)
+    per_class = [s.used_features_ for s in model.estimators_]
+    assert len({u.sum() for u in per_class}) > 1, "classes must differ for this to test anything"
+
     assert all(sub.binner_ is model.binner_ for sub in model.estimators_)
-    assert model.used_features_.sum() >= max(s.used_features_.sum() for s in model.estimators_)
+    carried = np.array([e.size > 0 for e in model.binner_.edges_])
+    union = np.logical_or.reduce(per_class)
+    assert not (union & ~carried).any(), "a class splits on a column with no edges"
     assert model.bin_table_bytes_ == sum(e.nbytes for e in model.binner_.edges_)
+
+    reference = SXEClassifier(**cfg).fit(X, y)
+    for sub in reference.estimators_:
+        sub.binner_ = QuantileBinner(reference.max_bins, random_state=0).fit(X)
+    assert np.array_equal(model.predict_proba(X), reference.predict_proba(X))

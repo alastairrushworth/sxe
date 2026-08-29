@@ -128,7 +128,7 @@
       ],
       "validation_fraction": 0.15
     },
-    "search_loss": 0.4671793561174316
+    "search_loss": 0.46641726616526774
   },
   "covtype_binary/LightGBM": {
     "params": {

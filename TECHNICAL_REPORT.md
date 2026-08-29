@@ -38,7 +38,7 @@ where $T_t$ are pruned trees, $B$ is the batch size, and $\mathcal{S}$ is the sp
 
 ### 3.1 Global quantile binning
 
-`QuantileBinner` (Python, `src/sxe/binning.py`) computes per-feature quantile edges from a subsample of at most 50,000 rows: 255 interior quantile points, deduplicated, giving at most 256 bins per feature. `transform` maps values via `searchsorted(edges, x, side='right')` to bin ids in `uint8`. All downstream stages — growth, holdout routing, pruning, member prediction, the weight-fit design matrix — operate on this one integer matrix (column-major for the C++ core). A uniform random threshold drawn by an extremely randomized split on binned data is exactly a random bin cut-point, so binning and ExtraTrees-style splitting compose without approximation.
+`QuantileBinner` (Python, `src/sxe/binning.py`) computes per-feature quantile edges from a subsample of at most 50,000 rows: 254 interior quantile points computed from the finite values only, deduplicated, giving at most 255 bins per feature. `transform` maps values via `searchsorted(edges, x, side='right')` to bin ids in `uint8`, and sends NaN to bin 255 -- the one bin the edges cannot reach. Missing values therefore need no support anywhere in the tree code: a split routes bin 255 like any other, so missing travels with the largest values unless a cut at 254 separates it, which the exact-cut scan finds when it pays. All downstream stages — growth, holdout routing, pruning, member prediction, the weight-fit design matrix — operate on this one integer matrix (column-major for the C++ core). A uniform random threshold drawn by an extremely randomized split on binned data is exactly a random bin cut-point, so binning and ExtraTrees-style splitting compose without approximation.
 
 ### 3.2 Exclusive feature bundling for binary columns (EFB)
 
@@ -56,7 +56,7 @@ where $S$, $S_L$, $S_R$ are target sums and $n$, $n_L$, $n_R$ counts in the node
 
 **Depth-wise growth with histogram subtraction (hybrid).** Nodes with at least `hybrid_min` samples (default 600) retain an all-feature histogram (`Hist`: `int32 cnt` and `double sum` laid out `[feature*256 + bin]`). Candidates are evaluated from prefix sums of this histogram — no data pass. After partitioning the node's index range in place, the *smaller* child's histogram is built from data in $O(|\text{small}| \cdot p)$ and the larger child's is derived by an in-place parent-minus-child subtraction, so the parent's buffer is reused and at most depth+1 buffers are live per thread (buffers are pooled). Children below `hybrid_min` recurse into the legacy grower, which builds per-candidate 256-bin histograms with touched-bin clearing and therefore has no memset overhead on small nodes. The threshold trades the full scheme's `p×256` clearing cost against its per-row savings; 600 worked across all three datasets.
 
-**Leaf-wise growth (optional, `max_leaves > 0`).** A best-first alternative in the style of LightGBM: a max-heap keyed on gain holds pending leaves with their histograms and precomputed best splits; the highest-gain leaf is split, children histograms are obtained by the same small-fill-plus-subtraction step, each child's best split is evaluated and pushed if it clears depth/size/gain floors, and growth stops at the leaf budget. Node ids satisfy parent < children, so the bottom-up passes below remain valid in both modes.
+**Leaf-wise growth (optional, `max_leaves > 0`).** A best-first alternative in the style of LightGBM: a max-heap keyed on gain holds pending leaves and their precomputed best splits; the highest-gain leaf is split, each child's histogram is built and its best split evaluated and pushed if it clears depth/size/gain floors, and growth stops at the leaf budget. The heap deliberately does *not* carry histograms. Keeping them would let the parent-minus-child subtraction serve the children, but a histogram is `p x 256 x 12` bytes and the heap holds up to the leaf budget of them -- on 500 features at 127 leaves that is ~195 MB per tree, times the batch width. Rebuilding a child's histogram when it is popped bounds the workspace at one live histogram and measures *faster* anyway, because the per-histogram reset it avoids costs more than the fill it saves (peak RSS 254 MB and 0.62 s against 906 MB and 0.90 s on 4000x500 data). Node ids satisfy parent < children, so the bottom-up passes below remain valid in both modes.
 
 **Per-tree randomization.** Each tree draws: `max_depth` from `depth_choices` (0 ⇒ capped at 64), `min_samples_leaf` log-uniform on `leaf_range`, the feature fraction $\phi$, and a row-subsample rate uniform on `subsample_range` (sampling without replacement). Seeds derive from `splitmix64(seed + c·tree_index)`, so results are deterministic and independent of thread count.
 
@@ -79,7 +79,7 @@ where $\hat\sigma^2_h$ is the root holdout variance and $L$ the subtree's (post-
 `sxe_boost` runs the whole generation loop natively. With residual $r \leftarrow y$ on the training partition and $F_{\text{val}} \leftarrow 0$:
 
 for batch $b = 1, \dots, \texttt{max\_batches}$:
-1. grow $B$ trees in parallel (OpenMP, dynamic schedule) on $(X, r)$, each with its own subsample, hyperparameters, holdout pruning, and export; each tree's predictions on the full training partition and on the validation fold are computed inside the parallel region;
+1. grow $B$ trees in parallel (a `std::thread` pool, dynamic schedule) on $(X, r)$, each with its own subsample, hyperparameters, holdout pruning, and export; each tree's predictions on the full training partition and on the validation fold are computed inside the parallel region;
 2. update $r \leftarrow r - \frac{\nu}{B} \sum_{t=1}^{B} T_t(X)$ and $F_{\text{val}} \leftarrow F_{\text{val}} + \frac{\nu}{B} \sum_t T_t(X_{\text{val}})$;
 3. early-stop if validation MSE has not improved by `tol` (set to $10^{-4}\,\mathrm{Var}(y_{\text{val}})$) for `patience` consecutive batches.
 
@@ -99,11 +99,13 @@ The legacy multi-round class (`CppSXE`) retains a per-round variant: full CV on 
 
 Prediction routes binned rows through the selected trees and forms $\beta_0 + \sum w\,T(x)$ (`sxe_predict_weighted`). Model size is accounted the same way for every library compared: 13 bytes per internal node (`feat` 4, `thr` 1, `left` 4, `right` 4), 8 bytes per leaf (`value`), plus the bin table needed to map raw features to bin ids at predict time (255 edges x 8 bytes per feature the model indexes, which for SXE is the post-bundling count). Earlier versions of this report compared an SXE format estimate against pickled baselines, which overstated the difference by 2-5x; Section 7 uses one formula on both sides. Note that leaf count is *not* a format-free proxy for size, and the size result does not go SXE's way everywhere -- Section 7.1 has it smaller on five of nine datasets and larger on four.
 
-**The compact format is not yet the format SXE writes.** `Ensemble::serialize` stores, for every node, `feat` (4) + `left` (4) + `right` (4) + `thr` (1) + `val` (8) + `gain` (8) = 29 bytes: `gain` is read only by `feature_importances_`, leaves carry four fields that are always `-1`/`0`, and internal nodes carry a `val` that `predict_row` never reads. Measured on Friedman1 at defaults, `serialize()` writes 469 kB where the formula says 164 kB -- 2.9x. Splitting the node arrays by type would make the advertised number the real one; until then, the size column is what SXE's format *could* be.
+**The format.** `Ensemble::serialize` stores what prediction needs and nothing else: 9 bytes per internal node (`feat` 4, `thr` 1, `right` 4), 8 per leaf (`val`), and one bit per node saying which is which. Three fields an earlier version wrote are gone. `left` is implied -- `export_member_safe` emits nodes in pre-order pushing right then left, so a node's left child is always the next id. `val` on internal nodes is never read; `predict_row` returns a value only at a leaf. And `gain`, which existed for `feature_importances_`, is accumulated once at fit into a p-vector, which is both smaller and cheaper than recomputing per call. The result is *below* the 13/8 portable layout, so `summary()` now reports the measured artefact -- `serialized_size()` plus the bin table -- rather than an estimate of a format the library does not implement.
+
+The bin table is pruned to the columns the trees actually index. On wide data that is most of the model: at defaults, madelon splits on 61 of 500 features and was carrying 421 kB of quantile edges for the other 439. Unused columns transform to bin 0, which is safe precisely because nothing reads them. A one-vs-rest classifier shares one table across its sub-models, covering the union of the columns they use.
 
 ### 3.8 Complexity
 
-Per tree, growth is $O(n_s(p + d))$ with subtraction at large nodes (histogram fills are dominated by smaller-child sums, ≤ $n_s p/2$ per level) plus $O(n_s d)$ for partitions, $O(n_h d)$ holdout routing, and $O(\text{nodes})$ pruning; $n_s$, $n_h$, $d$ are subsample size, holdout size, and depth. Residual updates add $O(n d)$ per tree. The weight fit costs one Gram, $O(n_{\text{val}} M_b^2)$ for $M_b$ batch columns, plus coordinate descent on $M_b \times M_b$. Measured single-core grower throughput: ≈ 27.8k leaves/s versus LightGBM's ≈ 13.9k leaves/s on Covertype — the wall-clock differences in Section 7 come from *how much* structure each method builds, not per-leaf cost.
+Per tree, depth-wise growth is $O(n_s(p + d))$ with subtraction at large nodes (histogram fills are dominated by smaller-child sums, ≤ $n_s p/2$ per level); leaf-wise growth gives up the subtraction and pays one full fill per node, in exchange for a workspace bounded at one histogram rather than one per pending leaf plus $O(n_s d)$ for partitions, $O(n_h d)$ holdout routing, and $O(\text{nodes})$ pruning; $n_s$, $n_h$, $d$ are subsample size, holdout size, and depth. Residual updates add $O(n d)$ per tree. The weight fit costs one Gram, $O(n_{\text{val}} M_b^2)$ for $M_b$ batch columns, plus coordinate descent on $M_b \times M_b$. Measured single-core grower throughput: ≈ 27.8k leaves/s versus LightGBM's ≈ 13.9k leaves/s on Covertype — the wall-clock differences in Section 7 come from *how much* structure each method builds, not per-leaf cost.
 
 ---
 
@@ -374,15 +376,23 @@ second-order leaf values). `predict_proba` is now Platt-scaled on the validation
 which makes it a probability rather than a clipped regression score; `calibrate=None`
 restores the old behaviour. Multiclass is a one-vs-rest reduction over the binary core,
 costing one full ensemble per class — on Letter that is 26 ensembles, 650k leaves and
-2.7× LightGBM's model for slightly worse accuracy. There is no missing-value handling
-and no general categorical handling beyond binary EFB; features are capped at 256 bins.
+2.7× LightGBM's model for slightly worse accuracy. Missing values are handled -- NaN
+gets its own bin -- but nothing learns a per-split default direction, and against median
+imputation on four datasets at 10% and 30% missingness the two are within noise of each
+other, so this buys convenience rather than accuracy. Infinity is still rejected: NaN
+means missing, infinity is a number the binning cannot place. There is no general
+categorical handling beyond binary EFB, and no `sample_weight`. Features are capped at
+255 bins plus the missing bin.
 `bundle_binary_features=True` assumes exclusivity it verifies only on the training data:
 a predict-time row with two active members of a bundle is silently encoded as the first
 of them.
 
 **Resolved since the original report.** Model persistence exists — trees serialize to a
 compact blob, so a fitted estimator pickles, deep-copies and travels to joblib workers.
-Growth uses a `std::thread` pool rather than OpenMP. The array boundary is typed
+Growth uses a `std::thread` pool rather than OpenMP. `predict_proba` is Platt-scaled on
+the validation fold. `bundle_binary_features` now raises on a predict-time exclusivity
+violation instead of silently encoding the row as its first active member, and
+`feature_importances_` works with bundling on. The array boundary is typed
 (pybind11). `hybrid_min` is now a pure performance knob: both growers recurse
 smaller-child-first, so it selects an implementation rather than a model. Concurrent
 `fit` calls on a single estimator instance are still unsupported, as they are for

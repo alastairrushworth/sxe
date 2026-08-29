@@ -91,3 +91,35 @@ def test_classifier_takes_missing():
     p = model.predict_proba(Xm)
     assert np.allclose(p.sum(axis=1), 1.0)
     assert model.score(Xm, y) > 0.6
+
+
+def test_bundling_propagates_missingness():
+    """A bundled column can arrive missing even though it was 0/1 at fit.
+
+    NaN is not an active member, so it must not be encoded as one, and two
+    missing members must not look like an exclusivity violation.
+    """
+    from sxe.bundling import BinaryBundler
+
+    train = np.array([[1, 0, 0], [0, 1, 0], [0, 0, 1], [1, 0, 0]], dtype=float)
+    b = BinaryBundler().fit(train)
+    out = b.transform(
+        np.array([[1, 0, 0], [np.nan, 0, 0], [np.nan, np.nan, 0], [0, 0, 0]], dtype=float)
+    ).ravel()
+    assert out[0] == 1
+    assert np.isnan(out[1]) and np.isnan(out[2])
+    assert out[3] == 0
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        b.transform(np.array([[1, 1, 0]], dtype=float))
+
+
+def test_bundled_model_fits_with_missing():
+    rng = np.random.default_rng(0)
+    n = 1200
+    onehot = np.zeros((n, 6))
+    onehot[np.arange(n), rng.integers(0, 6, n)] = 1.0
+    X = np.column_stack([onehot, rng.normal(size=(n, 3))])
+    y = onehot[:, 0] + onehot[:, 3] * 2 + rng.normal(scale=0.3, size=n)
+    X[rng.random(X.shape) < 0.05] = np.nan
+    model = SXERegressor(random_state=0, bundle_binary_features=True, **CFG).fit(X, y)
+    assert np.isfinite(model.predict(X)).all()
