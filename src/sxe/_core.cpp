@@ -498,8 +498,14 @@ SplitEval best_split_from_hist(const Hist& H, int p, int64_t m, double sum,
     return out;
 }
 
+// A pending leaf carries its best split, not the histogram that found it.
+// Keeping the histogram would let the parent-minus-child subtraction serve the
+// children, but it costs p*256*12 bytes per pending leaf -- on 500 features
+// with a 127-leaf budget that is ~195 MB per tree, times the batch width.
+// Rebuilding a child's histogram when it is popped bounds the workspace at one
+// live histogram instead, for roughly one extra fill per node.
 struct Pending {
-    double gain; int32_t id; int64_t lo, hi; int depth; Hist* H; int f, t;
+    double gain; int32_t id; int64_t lo, hi; int depth; int f, t;
     bool operator<(const Pending& o) const { return gain < o.gain; }
 };
 
@@ -521,14 +527,22 @@ void grow_tree_leafwise(GrownTree& T, const uint8_t* X, const double* y,
     };
 
     std::priority_queue<Pending> heap;
-    const int32_t root = make_node(0, n_sub);
-    {
+
+    // Evaluate a node's best split from a freshly built histogram and queue it
+    // if it clears the depth, size and gain floors. The histogram is released
+    // immediately, so at most one is live per workspace.
+    auto consider = [&](int32_t cid, int64_t clo, int64_t chi, int depth) {
+        const int64_t cm = chi - clo;
+        if (depth >= tp.max_depth || cm < 2 * (int64_t)tp.min_leaf) return;
         Hist* H = ws.acquire(p);
-        fill_hist(*H, X, y, n, p, ws.idx, 0, n_sub, ws.ybuf);
-        SplitEval e = best_split_from_hist(*H, p, n_sub, node_sum(root, 0, n_sub), ws, tp);
-        if (e.gain > 0) heap.push({e.gain, root, 0, n_sub, 0, H, e.f, e.t});
-        else ws.release(H);
-    }
+        fill_hist(*H, X, y, n, p, ws.idx, clo, chi, ws.ybuf);
+        SplitEval e = best_split_from_hist(*H, p, cm, node_sum(cid, clo, chi), ws, tp);
+        ws.release(H);
+        if (e.gain > 1e-12) heap.push({e.gain, cid, clo, chi, depth, e.f, e.t});
+    };
+
+    const int32_t root = make_node(0, n_sub);
+    consider(root, 0, n_sub, 0);
     int leaves = 1;
     while (!heap.empty() && leaves < tp.max_leaves) {
         Pending nd = heap.top(); heap.pop();
@@ -537,7 +551,7 @@ void grow_tree_leafwise(GrownTree& T, const uint8_t* X, const double* y,
         int64_t* mid = std::partition(base + nd.lo, base + nd.hi,
                                       [&](int64_t r) { return col[r] <= (uint8_t)nd.t; });
         const int64_t split = mid - base;
-        if (split == nd.lo || split == nd.hi) { ws.release(nd.H); continue; }
+        if (split == nd.lo || split == nd.hi) continue;
 
         T.feat[nd.id] = nd.f; T.thr[nd.id] = (uint8_t)nd.t; T.gain[nd.id] = nd.gain;
         const int32_t idl = make_node(nd.lo, split);
@@ -545,30 +559,17 @@ void grow_tree_leafwise(GrownTree& T, const uint8_t* X, const double* y,
         T.left[nd.id] = idl; T.right[nd.id] = idr;
         ++leaves;
 
+        // smaller child first, as both depth-wise growers do, so the per-tree
+        // RNG stream is consumed in one order throughout
         const bool left_small = (split - nd.lo) <= (nd.hi - split);
-        const int64_t slo = left_small ? nd.lo : split, shi = left_small ? split : nd.hi;
-        const int64_t llo = left_small ? split : nd.lo, lhi = left_small ? nd.hi : split;
-        const int32_t id_s = left_small ? idl : idr, id_l = left_small ? idr : idl;
-
-        Hist* HS = ws.acquire(p);
-        fill_hist(*HS, X, y, n, p, ws.idx, slo, shi, ws.ybuf);
-        {
-            const size_t sz = (size_t)p * 256;
-            int32_t* pc = nd.H->cnt.data(); const int32_t* sc = HS->cnt.data();
-            double*  ps = nd.H->sum.data(); const double*  ss = HS->sum.data();
-            for (size_t k = 0; k < sz; ++k) { pc[k] -= sc[k]; ps[k] -= ss[k]; }
+        if (left_small) {
+            consider(idl, nd.lo, split, nd.depth + 1);
+            consider(idr, split, nd.hi, nd.depth + 1);
+        } else {
+            consider(idr, split, nd.hi, nd.depth + 1);
+            consider(idl, nd.lo, split, nd.depth + 1);
         }
-        auto consider = [&](int32_t cid, int64_t clo, int64_t chi, Hist* CH) {
-            const int64_t cm = chi - clo;
-            if (nd.depth + 1 >= tp.max_depth || cm < 2 * (int64_t)tp.min_leaf) { ws.release(CH); return; }
-            SplitEval e = best_split_from_hist(*CH, p, cm, node_sum(cid, clo, chi), ws, tp);
-            if (e.gain > 1e-12) heap.push({e.gain, cid, clo, chi, nd.depth + 1, CH, e.f, e.t});
-            else ws.release(CH);
-        };
-        consider(id_s, slo, shi, HS);
-        consider(id_l, llo, lhi, nd.H);
     }
-    while (!heap.empty()) { ws.release(heap.top().H); heap.pop(); }
 }
 
 // route holdout rows, accumulating (cnt,sum,ssq) at every node on the path
