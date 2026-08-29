@@ -107,3 +107,63 @@ def test_corrupt_blob_raises_rather_than_crashing():
         Ensemble.deserialize(b"not a model at all")
     with pytest.raises(Exception, match="truncated|magic"):
         Ensemble.deserialize(b"SXEB")
+
+
+def test_reported_size_is_the_bytes_actually_written(fitted_reg):
+    """summary() must describe the artefact, not a format SXE does not write.
+
+    The old estimate assumed 13 bytes per internal node and 8 per leaf while
+    serialize() wrote 29 bytes for every node, so the advertised size was off
+    by nearly 3x. model_size_bytes_ is now measured.
+    """
+    model, _ = fitted_reg
+    blob = model.ensemble_.serialize()
+    assert model.tree_bytes_ == len(blob)
+    assert model.bin_table_bytes_ == sum(e.nbytes for e in model.binner_.edges_)
+    assert model.model_size_bytes_ == model.tree_bytes_ + model.bin_table_bytes_
+
+
+def test_blob_is_smaller_than_the_portable_layout(fitted_reg):
+    """The pre-order invariant makes left children implicit, so the real blob
+    beats the 13-bytes-per-internal-node layout used to compare libraries."""
+    model, _ = fitted_reg
+    internal = model.n_nodes_ - model.n_leaves_
+    portable = internal * 13 + model.n_leaves_ * 8
+    assert model.tree_bytes_ < portable
+
+
+def test_importances_survive_a_round_trip(fitted_reg):
+    """Split gains are dropped from the blob, so they must be cached at fit."""
+    model, _ = fitted_reg
+    restored = pickle.loads(pickle.dumps(model))
+    assert np.array_equal(restored.feature_importances_, model.feature_importances_)
+
+
+def test_pruned_bin_table_does_not_change_predictions(fitted_reg):
+    """Unused columns transform to bin 0 instead of their true bin. That is
+    only safe if no tree indexes them, so check it against a full binner."""
+    from sxe.binning import QuantileBinner
+
+    model, X = fitted_reg
+    before = model.predict(X)
+    assert model.bin_table_bytes_ <= sum(
+        e.nbytes for e in QuantileBinner(model.max_bins, random_state=0).fit(X).edges_
+    )
+    model.binner_ = QuantileBinner(model.max_bins, random_state=0).fit(X)
+    assert np.array_equal(before, model.predict(X))
+
+
+def test_multiclass_shares_one_bin_table():
+    """One table for all classes, covering the union of the columns they use."""
+    X, y = make_classification(
+        n_samples=900,
+        n_features=10,
+        n_informative=6,
+        n_classes=3,
+        n_clusters_per_class=1,
+        random_state=0,
+    )
+    model = SXEClassifier(random_state=0, **CFG).fit(X, y)
+    assert all(sub.binner_ is model.binner_ for sub in model.estimators_)
+    assert model.used_features_.sum() >= max(s.used_features_.sum() for s in model.estimators_)
+    assert model.bin_table_bytes_ == sum(e.nbytes for e in model.binner_.edges_)

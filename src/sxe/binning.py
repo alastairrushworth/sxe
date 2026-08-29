@@ -70,5 +70,28 @@ class QuantileBinner:
             out[:, j] = np.searchsorted(e, X[:, j], side="right")
         return out
 
+    def restrict(self, used) -> QuantileBinner:
+        """Drop the edges of features nothing downstream will index.
+
+        A fitted ensemble usually splits on a fraction of the columns it was
+        offered, but the edges of the rest ship with the model anyway -- on
+        wide data that is most of the model. Dropping them leaves an empty
+        edge array, and ``searchsorted`` on empty returns 0, so those columns
+        transform to bin 0 instead of their true bin. That is safe precisely
+        because nothing reads them; call this only with a mask taken from the
+        consumer that will use the result.
+        """
+        if not hasattr(self, "edges_"):
+            raise ValueError("QuantileBinner is not fitted yet; call fit() first")
+        used = np.asarray(used, dtype=bool)
+        if used.shape != (self.n_features_in_,):
+            raise ValueError(
+                f"used must be a boolean mask over {self.n_features_in_} features, "
+                f"got shape {used.shape}"
+            )
+        empty = np.empty(0, dtype=np.float64)
+        self.edges_ = [e if u else empty for e, u in zip(self.edges_, used)]
+        return self
+
     def fit_transform(self, X) -> np.ndarray:
         return self.fit(X).transform(X)

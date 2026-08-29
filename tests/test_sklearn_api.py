@@ -104,12 +104,15 @@ def test_feature_importances(reg_data):
     assert imp.sum() == pytest.approx(1.0)
 
 
-def test_feature_importances_unavailable_when_bundling():
+def test_feature_importances_map_back_through_bundling():
+    """Bundling must not remove the model's only introspection."""
     X, y = make_classification(n_samples=400, n_features=10, random_state=0)
     Xb = (X > 0).astype(float)
     model = SXEClassifier(random_state=0, bundle_binary_features=True, **CFG).fit(Xb, y)
-    with pytest.raises(AttributeError, match="bundle_binary_features"):
-        _ = model.feature_importances_
+    imp = model.feature_importances_
+    assert imp.shape == (Xb.shape[1],)
+    assert (imp >= 0).all()
+    assert np.isclose(imp.sum(), 1.0)
 
 
 def test_check_estimator_regressor():

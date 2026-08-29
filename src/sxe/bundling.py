@@ -83,7 +83,39 @@ class BinaryBundler:
             out[:, :k] = np.asarray(X[:, self.passthrough_], dtype=np.float64)
         for i, cols in enumerate(self.bundles_):
             sub = np.asarray(X[:, cols], dtype=np.float64) != 0.0
-            out[:, k + i] = np.where(sub.any(axis=1), sub.argmax(axis=1) + 1, 0)
+            # Exclusivity is verified on the training data and assumed here.
+            # Silently encoding a conflicting row as its first active member
+            # would make it indistinguishable from a row where only that
+            # member is set, so check rather than assume: it is one extra pass
+            # over a boolean array that was needed anyway.
+            active = sub.sum(axis=1)
+            bad = np.flatnonzero(active > 1)
+            if bad.size:
+                r = int(bad[0])
+                members = [cols[j] for j in np.flatnonzero(sub[r])]
+                raise ValueError(
+                    f"row {r} sets columns {members} at once, but they were "
+                    f"mutually exclusive in the training data and were bundled "
+                    f"together. Refit with bundle_binary_features=False, or drop "
+                    f"the conflicting rows."
+                )
+            out[:, k + i] = np.where(active > 0, sub.argmax(axis=1) + 1, 0)
+        return out
+
+    def unbundle(self, values):
+        """Spread per-bundled-column quantities back over the input columns.
+
+        A threshold split on a bundle separates a contiguous group of its
+        members from the rest, so the split's gain belongs to the group rather
+        than to any one member. Dividing it equally is the least arbitrary
+        choice available without tracking which members each threshold cut.
+        """
+        out = np.zeros(self.n_features_in_, dtype=np.float64)
+        for i, j in enumerate(self.passthrough_):
+            out[j] = values[i]
+        k = len(self.passthrough_)
+        for i, cols in enumerate(self.bundles_):
+            out[list(cols)] += values[k + i] / len(cols)
         return out
 
     def fit_transform(self, X) -> np.ndarray:

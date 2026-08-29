@@ -18,14 +18,6 @@ from .bundling import BinaryBundler
 
 __all__ = ["SXERegressor", "SXEClassifier"]
 
-# Compact serialized-size estimate: internal nodes carry (feat, thr, left,
-# right) = 13 bytes, leaves carry a single double. The bin table counts too --
-# the trees index bins, not feature values, so the quantile edges have to ship
-# with them or the model cannot predict. benchmarks/bench_final.py applies this
-# same accounting to every library it compares against.
-_BYTES_PER_INTERNAL = 13
-_BYTES_PER_LEAF = 8
-
 try:  # scikit-learn >= 1.6
     from sklearn.utils.validation import validate_data as _sk_validate_data
 except ImportError:  # pragma: no cover - older scikit-learn
@@ -366,6 +358,7 @@ class _BaseSXE(BaseEstimator):
             X = self.bundler_.transform(X)
         else:
             self.bundler_ = None
+        n_model_features = X.shape[1]
 
         self.binner_ = QuantileBinner(self.max_bins, random_state=self.random_state).fit(X)
         Xb = self.binner_.transform(X)
@@ -444,11 +437,18 @@ class _BaseSXE(BaseEstimator):
         self.n_trees_ = int(n_members)
         self.n_trees_kept_ = int(self.ensemble_.n_members)
         self.n_leaves_ = int(leaves)
-        # kept separate so the one-vs-rest classifier can sum the trees across
-        # its sub-models without counting the shared bin table once per class
-        self.tree_bytes_ = int((nodes - leaves) * _BYTES_PER_INTERNAL + leaves * _BYTES_PER_LEAF)
-        self.bin_table_bytes_ = int(sum(e.nbytes for e in self.binner_.edges_))
-        self.model_size_bytes_ = self.tree_bytes_ + self.bin_table_bytes_
+        self.n_nodes_ = int(nodes)
+
+        # Accumulated once, here, rather than on every feature_importances_
+        # call: the members and weights are fixed from now on, and caching the
+        # p-vector is what lets the serialized trees drop their split gains.
+        self.feature_gains_ = self.ensemble_.feature_gains(
+            self._members, self.weights_, n_model_features
+        )
+        self.used_features_ = np.asarray(
+            self.ensemble_.used_features(self._members, n_model_features), dtype=bool
+        )
+        self._compact(self.used_features_)
         self.fit_time_ = time.perf_counter() - t0
 
         if self.verbose:
@@ -458,6 +458,18 @@ class _BaseSXE(BaseEstimator):
                 f"{self.fit_time_:.2f}s"
             )
         return self
+
+    def _compact(self, used):
+        """Drop dead bin edges and record what the fitted model actually costs.
+
+        ``model_size_bytes_`` is the artefact: the bytes ``serialize()`` writes
+        plus the quantile edges that have to travel with it. Nothing here is an
+        estimate of a format SXE does not implement.
+        """
+        self.binner_.restrict(used)
+        self.tree_bytes_ = int(self.ensemble_.serialized_size())
+        self.bin_table_bytes_ = int(sum(e.nbytes for e in self.binner_.edges_))
+        self.model_size_bytes_ = self.tree_bytes_ + self.bin_table_bytes_
 
     def _fit_calibrator(self, Xval, y_val, n_jobs):
         """Regression output is already on the target's scale."""
@@ -481,32 +493,31 @@ class _BaseSXE(BaseEstimator):
     # -- introspection -------------------------------------------------------
     @property
     def feature_importances_(self):
-        """Split-gain importances, weighted by each member's ensemble weight.
+        """Split-gain importances over the input columns, summing to one.
 
-        Normalised to sum to one. When ``bundle_binary_features=True`` the
-        importances are reported over the bundled feature space, which does
-        not line up with the input columns.
+        Weighted by each member's ensemble weight. With
+        ``bundle_binary_features=True`` the trees split on bundled columns, so
+        each bundle's gain is divided equally among its members -- a threshold
+        on a bundle separates a group of them, not one. Treat those entries as
+        a per-bundle figure spread over its columns rather than a per-column
+        measurement.
         """
         check_is_fitted(self)
+        g = self.feature_gains_
         if self.bundler_ is not None:
-            raise AttributeError(
-                "feature_importances_ is not available when "
-                "bundle_binary_features=True: the model is fitted on bundled "
-                "columns, which do not map one-to-one onto the input features"
-            )
-        g = self.ensemble_.feature_gains(self._members, self.weights_, self.n_features_in_)
+            g = self.bundler_.unbundle(g)
         total = g.sum()
         return g / total if total > 0 else g
 
     def summary(self) -> dict:
         """Fit diagnostics: trees grown and kept, structure, size, timings.
 
-        ``model_size_mb`` is a compact-format estimate of everything that has
-        to ship to make a prediction: the tree structure (13 bytes per internal
-        node, 8 per leaf) plus the quantile bin table, broken out as
-        ``tree_size_mb`` and ``bin_table_mb``. It is not the size of a pickle
-        of this object, which carries per-node split gains and Python overhead
-        on top.
+        ``model_size_mb`` is everything that has to ship to make a prediction,
+        measured rather than estimated: the bytes ``serialize()`` writes for
+        the trees plus the quantile edges of the columns they index, broken out
+        as ``tree_size_mb`` and ``bin_table_mb``. A pickle of this object is
+        somewhat larger -- it carries the estimator's parameters and Python
+        object overhead on top.
         """
         check_is_fitted(self)
         return {
@@ -655,16 +666,27 @@ class SXEClassifier(ClassifierMixin, _CalibratesBinary, _BaseSXE):
         self.n_trees_ = sum(s.n_trees_ for s in subs)
         self.n_trees_kept_ = sum(s.n_trees_kept_ for s in subs)
         self.n_leaves_ = sum(s.n_leaves_ for s in subs)
-        # every sub-model bins the same X the same way, so the bin table is
-        # shared and must be counted once, not once per class
+        self.n_nodes_ = sum(s.n_nodes_ for s in subs)
+        self.feature_gains_ = np.mean([s.feature_gains_ for s in subs], axis=0)
+        self.bundler_ = subs[0].bundler_
+
+        # Every sub-model binned the same X with the same seed, so their edges
+        # are identical and one table can serve all of them -- but each pruned
+        # its own copy to its own columns, so the shared table has to cover the
+        # union. Sharing the object, rather than counting one and storing many,
+        # is what makes the reported size the size.
+        self.used_features_ = np.logical_or.reduce([s.used_features_ for s in subs])
+        self.binner_ = subs[0].binner_
+        self.binner_.restrict(self.used_features_)
+        for sub in subs:
+            sub.binner_ = self.binner_
+
         self.tree_bytes_ = sum(s.tree_bytes_ for s in subs)
-        self.bin_table_bytes_ = subs[0].bin_table_bytes_
+        self.bin_table_bytes_ = int(sum(e.nbytes for e in self.binner_.edges_))
         self.model_size_bytes_ = self.tree_bytes_ + self.bin_table_bytes_
         self.grow_time_ = sum(s.grow_time_ for s in subs)
         self.weight_fit_time_ = sum(s.weight_fit_time_ for s in subs)
         self.fit_time_ = sum(s.fit_time_ for s in subs)
-        self.bundler_ = subs[0].bundler_
-        self.binner_ = subs[0].binner_
 
     def _class_scores(self, X):
         check_is_fitted(self)

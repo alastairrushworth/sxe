@@ -667,8 +667,24 @@ inline double predict_row(const Tree& T, const uint8_t* X, int64_t n, int64_t r)
 // ---------------------------------------------------------------------------
 // serialization
 // ---------------------------------------------------------------------------
+// The blob stores what prediction needs and nothing else. Three fields that
+// v1 wrote are gone:
+//
+//   * `left` -- export_member_safe emits nodes in pre-order pushing right then
+//     left, so a node's left child is always the next id. It is recomputed.
+//   * `val` on internal nodes -- predict_row reads a value only at a leaf.
+//   * `gain` everywhere -- it existed for feature_importances_, which the
+//     estimator now accumulates once at fit time into a p-vector. Gains come
+//     back zeroed; nothing in the Python layer reads them after a load.
+//
+// What remains is 9 bytes per internal node, 8 per leaf, and one bit per node
+// saying which is which -- below the 13/8 figure `summary()` reports, because
+// that figure is a portable layout used to compare libraries and this one
+// exploits the pre-order invariant.
 const char kMagic[4] = {'S', 'X', 'E', 'B'};
-const uint32_t kFormatVersion = 1;
+const uint32_t kFormatVersion = 2;
+
+inline size_t bitmap_bytes(size_t n_nodes) { return (n_nodes + 7) / 8; }
 
 template <class T>
 void put(std::string& buf, const T& v) {
@@ -1041,6 +1057,28 @@ public:
         return out;
     }
 
+    // Which input columns any selected member actually splits on. The bin
+    // table only has to ship edges for these -- on wide data most columns are
+    // never indexed and their quantile edges are dead weight.
+    py::array_t<bool> used_features(const ArrI32& mem, int n_features_out) const {
+        const std::vector<int32_t> idx = check_members(mem);
+        if (n_features_out < 0) throw std::invalid_argument("n_features must be >= 0");
+        py::array_t<bool> out((py::ssize_t)n_features_out);
+        bool* o = out.mutable_data();
+        std::fill(o, o + n_features_out, false);
+        for (int32_t i : idx) {
+            const Tree& T = members[(size_t)i];
+            for (size_t k = 0; k < T.feat.size(); ++k) {
+                const int32_t f = T.feat[k];
+                if (f < 0) continue;
+                if (f >= n_features_out)
+                    throw std::runtime_error("model references a feature index beyond n_features");
+                o[f] = true;
+            }
+        }
+        return out;
+    }
+
     // -- compaction ---------------------------------------------------------
     // Keep only the given members, renumbered 0..len(mem)-1.  This is the
     // "physically delete the zero-weight members" step: after it, the model
@@ -1063,17 +1101,42 @@ public:
         put(buf, (int32_t)n_features);
         put(buf, (uint64_t)members.size());
         for (const Tree& T : members) {
+            const size_t nn = T.feat.size();
             put(buf, T.n_leaves);
             put(buf, T.base_id);
             put(buf, T.variant);
-            put_vec(buf, T.feat);
-            put_vec(buf, T.left);
-            put_vec(buf, T.right);
-            put_vec(buf, T.thr);
-            put_vec(buf, T.val);
-            put_vec(buf, T.gain);
+            put(buf, (uint64_t)nn);
+
+            std::vector<uint8_t> mask(bitmap_bytes(nn), 0);
+            for (size_t i = 0; i < nn; ++i)
+                if (T.feat[i] >= 0) mask[i >> 3] |= (uint8_t)(1u << (i & 7));
+            buf.append(reinterpret_cast<const char*>(mask.data()), mask.size());
+
+            for (size_t i = 0; i < nn; ++i) {
+                if (T.feat[i] < 0) continue;
+                if (T.left[i] != (int32_t)i + 1)
+                    throw std::runtime_error("SXE: tree is not in pre-order; cannot serialize");
+                put(buf, T.feat[i]);
+                put(buf, T.thr[i]);
+                put(buf, T.right[i]);
+            }
+            for (size_t i = 0; i < nn; ++i)
+                if (T.feat[i] < 0) put(buf, T.val[i]);
         }
         return py::bytes(buf);
+    }
+
+    // Bytes serialize() would produce, without building the buffer. Used at
+    // fit time so summary() can report the size of the real artefact.
+    int64_t serialized_size() const {
+        int64_t total = 4 + (int64_t)sizeof(kFormatVersion) + 4 + 8;
+        for (const Tree& T : members) {
+            const size_t nn = T.feat.size();
+            total += 4 + 4 + 4 + 8 + (int64_t)bitmap_bytes(nn);
+            total += (int64_t)(nn - (size_t)T.n_leaves) * 9;  // feat 4 + thr 1 + right 4
+            total += (int64_t)T.n_leaves * 8;                 // val
+        }
+        return total;
     }
 
     static Ensemble deserialize(const py::bytes& blob) {
@@ -1097,25 +1160,37 @@ public:
             T.n_leaves = rd.get<int32_t>();
             T.base_id = rd.get<int32_t>();
             T.variant = rd.get<int32_t>();
-            T.feat = rd.get_vec<int32_t>();
-            T.left = rd.get_vec<int32_t>();
-            T.right = rd.get_vec<int32_t>();
-            T.thr = rd.get_vec<uint8_t>();
-            T.val = rd.get_vec<double>();
-            T.gain = rd.get_vec<double>();
-            const size_t nn = T.feat.size();
-            if (T.left.size() != nn || T.right.size() != nn || T.thr.size() != nn ||
-                T.val.size() != nn || T.gain.size() != nn || nn == 0)
-                throw std::runtime_error("SXE: inconsistent node arrays in model blob");
-            // structural validation: a corrupt blob must not become a wild read
+            const uint64_t nn64 = rd.get<uint64_t>();
+            if (nn64 == 0 || nn64 > (uint64_t)INT32_MAX)
+                throw std::runtime_error("SXE: implausible node count in model blob");
+            const size_t nn = (size_t)nn64;
+
+            rd.need(bitmap_bytes(nn));
+            const uint8_t* mask = reinterpret_cast<const uint8_t*>(rd.p);
+            rd.p += bitmap_bytes(nn);
+
+            T.feat.assign(nn, -1); T.thr.assign(nn, 0);
+            T.left.assign(nn, -1); T.right.assign(nn, -1);
+            T.val.assign(nn, 0.0); T.gain.assign(nn, 0.0);
+
+            int32_t leaves = 0;
             for (size_t k = 0; k < nn; ++k) {
-                if (T.feat[k] < 0) continue;
-                if (out.n_features >= 0 && T.feat[k] >= out.n_features)
+                if (!(mask[k >> 3] & (1u << (k & 7)))) { ++leaves; continue; }
+                T.feat[k] = rd.get<int32_t>();
+                T.thr[k] = rd.get<uint8_t>();
+                T.right[k] = rd.get<int32_t>();
+                T.left[k] = (int32_t)k + 1;
+                // a corrupt blob must not become a wild read
+                if (out.n_features >= 0 && (T.feat[k] < 0 || T.feat[k] >= out.n_features))
                     throw std::runtime_error("SXE: feature index out of range in model blob");
-                if (T.left[k] <= (int32_t)k || T.right[k] <= (int32_t)k ||
-                    T.left[k] >= (int32_t)nn || T.right[k] >= (int32_t)nn)
+                if (T.left[k] >= (int32_t)nn || T.right[k] <= (int32_t)k ||
+                    T.right[k] >= (int32_t)nn)
                     throw std::runtime_error("SXE: child index out of range in model blob");
             }
+            if (leaves != T.n_leaves)
+                throw std::runtime_error("SXE: leaf count disagrees with the node map");
+            for (size_t k = 0; k < nn; ++k)
+                if (T.feat[k] < 0) T.val[k] = rd.get<double>();
         }
         return out;
     }
@@ -1153,6 +1228,11 @@ PYBIND11_MODULE(_core, m) {
         .def("predict_weighted", &Ensemble::predict_weighted,
              py::arg("X"), py::arg("members"), py::arg("weights"),
              py::arg("intercept"), py::arg("n_jobs") = -1)
+        .def("used_features", &Ensemble::used_features,
+             py::arg("members"), py::arg("n_features"),
+             "Boolean mask of the input columns any selected member splits on.")
+        .def("serialized_size", &Ensemble::serialized_size,
+             "Bytes serialize() would produce, without building the buffer.")
         .def("member_info", &Ensemble::member_info, py::arg("i"))
         .def("structure", &Ensemble::structure, py::arg("members"))
         .def("feature_gains", &Ensemble::feature_gains,

@@ -134,3 +134,20 @@ def test_small_dataset_fits(reg_data):
     X, y = make_regression(n_samples=40, n_features=4, noise=1.0, random_state=0)
     model = SXERegressor(random_state=0, max_iter=3, batch_size=2).fit(X, y)
     assert model.predict(X).shape == (40,)
+
+
+def test_bundler_rejects_predict_time_conflicts():
+    """A bundle assumes exclusivity; a row that breaks it must not be guessed at.
+
+    Encoding a two-active row as its first active member makes it
+    indistinguishable from a row where only that member is set, so the
+    prediction would be silently wrong rather than refused.
+    """
+    from sxe.bundling import BinaryBundler
+
+    train = np.array([[1, 0, 0], [0, 1, 0], [0, 0, 1], [1, 0, 0]], dtype=float)
+    b = BinaryBundler().fit(train)
+    assert b.bundles_ == [[0, 1, 2]]
+    assert np.array_equal(b.transform(train).ravel(), [1, 2, 3, 1])
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        b.transform(np.array([[1, 1, 0]], dtype=float))
