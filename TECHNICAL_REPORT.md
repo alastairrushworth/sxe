@@ -38,7 +38,7 @@ where $T_t$ are pruned trees, $B$ is the batch size, and $\mathcal{S}$ is the sp
 
 ### 3.1 Global quantile binning
 
-`QuantileBinner` (Python, `src/sxe/binning.py`) computes per-feature quantile edges from a subsample of at most 50,000 rows: 254 interior quantile points computed from the finite values only, deduplicated, giving at most 255 bins per feature. `transform` maps values via `searchsorted(edges, x, side='right')` to bin ids in `uint8`, and sends NaN to bin 255 -- the one bin the edges cannot reach. Missing values therefore need no support anywhere in the tree code: a split routes bin 255 like any other, so missing travels with the largest values unless a cut at 254 separates it, which the exact-cut scan finds when it pays. All downstream stages — growth, holdout routing, pruning, member prediction, the weight-fit design matrix — operate on this one integer matrix (column-major for the C++ core). A uniform random threshold drawn by an extremely randomized split on binned data is exactly a random bin cut-point, so binning and ExtraTrees-style splitting compose without approximation.
+`QuantileBinner` (Python, `src/sxe/binning.py`) computes per-feature quantile edges from a subsample of at most 50,000 rows: 254 interior quantile points computed from the finite values only, deduplicated, giving at most 255 bins per feature. `max_bins` counts the bins available to real values -- 255 by default, matching scikit-learn's `HistGradientBoosting*` -- and the 256th is reserved. `transform` maps values via `searchsorted(edges, x, side='right')` to bin ids in `uint8`, and sends NaN to bin 255 -- the one bin the edges cannot reach. Missing values therefore need no support anywhere in the tree code: a split routes bin 255 like any other, so missing travels with the largest values unless a cut at 254 separates it, which the exact-cut scan finds when it pays. All downstream stages — growth, holdout routing, pruning, member prediction, the weight-fit design matrix — operate on this one integer matrix (column-major for the C++ core). A uniform random threshold drawn by an extremely randomized split on binned data is exactly a random bin cut-point, so binning and ExtraTrees-style splitting compose without approximation.
 
 ### 3.2 Exclusive feature bundling for binary columns (EFB)
 
@@ -173,7 +173,7 @@ The package names are on the left; the names used in the rest of this report and
 | `validation_fraction` | 0.18 | `val_fraction` | validation fold for early stopping and the weight fit. |
 | `bundle_binary_features` | False | `bundle_binary` | enable EFB for binary columns. |
 | `hybrid_min` | 600 | — | node size above which the subtraction scheme is used. |
-| `max_bins` | 256 | `n_bins` | quantile bins per feature; the top bin is reserved for missing values. |
+| `max_bins` | 255 | `n_bins` | quantile bins per feature for non-missing values; a further bin is reserved for missing. |
 | `l1_ratio`, `n_alphas`, `weight_cv` | 1.0, 20, 3 | `l1_ratios`, `n_alphas`, `cv` | weight-fit grid (positive lasso, Gram-precomputed CV). |
 | `n_jobs` | None | — | threads for growth and prediction; None ⇒ all cores. Results do not depend on it. |
 | `random_state` | None | — | seeds binning, the split, and per-tree randomisation. |
@@ -381,8 +381,8 @@ gets its own bin -- but nothing learns a per-split default direction, and agains
 imputation on four datasets at 10% and 30% missingness the two are within noise of each
 other, so this buys convenience rather than accuracy. Infinity is still rejected: NaN
 means missing, infinity is a number the binning cannot place. There is no general
-categorical handling beyond binary EFB, and no `sample_weight`. Features are capped at
-255 bins plus the missing bin.
+categorical handling beyond binary EFB, and no `sample_weight`. Features are capped at 255 bins
+plus the missing bin.
 `bundle_binary_features=True` assumes exclusivity it verifies only on the training data:
 a predict-time row with two active members of a bundle is silently encoded as the first
 of them.

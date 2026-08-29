@@ -19,7 +19,10 @@ import numpy as np
 
 __all__ = ["QuantileBinner"]
 
-MAX_BINS = 256
+# Bins for non-finite values, matching scikit-learn's HistGradientBoosting
+# vocabulary: ``max_bins`` counts the bins available to real values, and the
+# 256th is reserved for missing.
+MAX_BINS = 255
 MISSING_BIN = 255
 
 
@@ -32,8 +35,9 @@ class QuantileBinner:
 
     Parameters
     ----------
-    n_bins : int, default=256
-        Maximum number of bins per feature. Must be in [2, 256].
+    n_bins : int, default=255
+        Bins per feature for non-missing values; at most 255. Missing values
+        occupy a further, reserved bin.
     subsample : int, default=50_000
         Rows sampled to estimate the quantile edges.
     random_state : int, RandomState, Generator or None
@@ -55,9 +59,9 @@ class QuantileBinner:
         n = X.shape[0]
         if n > self.subsample:
             X = X[rng.choice(n, self.subsample, replace=False)]
-        # One fewer interior point than there are bins, so the largest finite
-        # bin is 254 and MISSING_BIN stays free.
-        qs = np.linspace(0.0, 1.0, self.n_bins)[1:-1]
+        # n_bins - 1 interior points give n_bins bins numbered 0..n_bins-1, so
+        # with n_bins <= 255 the largest is 254 and MISSING_BIN stays free.
+        qs = np.linspace(0.0, 1.0, self.n_bins + 1)[1:-1]
         self.edges_ = [self._column_edges(X[:, j], qs) for j in range(X.shape[1])]
         self.n_features_in_ = X.shape[1]
         return self

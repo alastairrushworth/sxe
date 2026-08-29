@@ -138,9 +138,10 @@ class _BaseSXE(BaseEstimator):
     validation_fraction : float, default=0.18
         Fraction of the training data held out for early stopping and the
         weight fit. Note this fold is used for both.
-    max_bins : int, default=256
-        Quantile bins per feature; at most 256. The top bin is reserved for
-        missing values, so finite values occupy at most 255 of them.
+    max_bins : int, default=255
+        Quantile bins per feature for non-missing values; at most 255. Missing
+        values occupy a further, reserved bin, as in scikit-learn's
+        ``HistGradientBoosting*``.
     max_depth_choices : tuple of int, default=(6, 8, 10, 12)
         Per-tree max depth, sampled uniformly. 0 means unlimited (capped 64).
     max_leaf_nodes : int or None, default=None
@@ -208,7 +209,7 @@ class _BaseSXE(BaseEstimator):
         n_iter_no_change=15,
         tol=1e-4,
         validation_fraction=0.18,
-        max_bins=256,
+        max_bins=255,
         max_depth_choices=(6, 8, 10, 12),
         max_leaf_nodes=None,
         min_samples_leaf_range=(10, 60),

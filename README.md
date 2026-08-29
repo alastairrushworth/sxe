@@ -57,7 +57,8 @@ physically deletes the batches that contribute nothing — which is where the
 size reduction comes from.
 
 The full derivation, the ablations behind each component, and the honest
-caveats are in [TECHNICAL_REPORT.md](TECHNICAL_REPORT.md).
+caveats are in the technical paper, [`paper/sxe.pdf`](paper/sxe.pdf) (LaTeX
+source alongside it).
 
 ## Why you might use it
 
@@ -139,7 +140,7 @@ it should be — see [The defaults are the weak point](#the-defaults-are-the-wea
 The per-dataset configurations found by the random search are in
 [`benchmarks/tuned_configs.json`](benchmarks/tuned_configs.json); the search space
 is in [`benchmarks/bench_suite.py`](benchmarks/bench_suite.py). Distilled guidance
-from section 5 of the technical report:
+from appendix B of [the paper](paper/sxe.pdf):
 
 - **Smooth, low-dimensional signal**: fine trajectories. Small `learning_rate`,
   many batches, small `batch_size`, mild subsampling (0.85–1.0),
@@ -221,7 +222,7 @@ the selected configurations in
 
 ## Caveats
 
-Read section 8 of the technical report before quoting any of this. In short:
+Read section 8 of [the paper](paper/sxe.pdf) before quoting any of this. In short:
 
 - **The defaults do not reproduce the table.** They give up a median 9.5% to tuning
   against LightGBM's 3.3%. This is the largest gap between the method and a library
@@ -258,7 +259,7 @@ Read section 8 of the technical report before quoting any of this. In short:
 | `src/sxe/bundling.py` | Exclusive feature bundling for binary columns. |
 | `benchmarks/` | Reproducible head-to-head against LightGBM. |
 | `reference/` | The original ctypes prototype, kept for ablation and as a parity oracle. Not installed. |
-| `TECHNICAL_REPORT.md` | Derivation, ablations, benchmarks, caveats. |
+| `paper/` | Technical paper: derivation, ablations, benchmarks, caveats. LaTeX source and PDF. |
 
 ## License
 
