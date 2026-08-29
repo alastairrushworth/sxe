@@ -31,18 +31,18 @@ Those are the *default* parameters, not the tuned benchmark configuration — se
 
 ## Install
 
-```bash
-pip install sxe
-```
-
-Building from source needs a C++17 compiler and CMake; there is no OpenMP
-dependency, so no `brew install libomp` step on macOS.
+Not on PyPI yet — install from a checkout. Building needs a C++17 compiler and
+CMake; there is no OpenMP dependency, so no `brew install libomp` step on macOS.
 
 ```bash
 git clone https://github.com/alastairrushworth/sxe
 cd sxe
 pip install -e .
 ```
+
+Wheels for Linux, macOS and Windows on CPython 3.9–3.13 are built and tested on
+every push, and pushing a `v*` tag publishes them. `pip install sxe` will work
+from the first tagged release.
 
 ## What it does
 
@@ -79,7 +79,8 @@ caveats are in [TECHNICAL_REPORT.md](TECHNICAL_REPORT.md).
 - **The defaults give up more to tuning than LightGBM's do** — a median 9.5% error
   reduction against 3.3%, on eight of nine datasets. Budget for a search, or wait
   for better defaults; see [Tuning](#tuning).
-- **It is not on PyPI yet.** Install from a checkout until it is.
+- **It is not on PyPI yet.** Install from a checkout until the first tagged
+  release; see [Install](#install).
 
 ## API
 

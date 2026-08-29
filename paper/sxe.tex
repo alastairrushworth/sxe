@@ -1,0 +1,1488 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{array}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{caption}
+\usepackage{enumitem}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{listings}
+\usepackage[hidelinks,colorlinks=true,linkcolor=black,citecolor=black,urlcolor=blue]{hyperref}
+
+\definecolor{codebg}{gray}{0.96}
+\lstset{
+  basicstyle=\ttfamily\small,
+  backgroundcolor=\color{codebg},
+  frame=none,
+  breaklines=true,
+  columns=fullflexible,
+  keepspaces=true,
+  showstringspaces=false,
+  xleftmargin=1em,
+  framexleftmargin=1em,
+}
+
+\newcommand{\code}[1]{\texttt{\small #1}}
+\newcommand{\SXE}{\textsc{SXE}}
+\DeclareMathOperator*{\argmax}{arg\,max}
+\DeclareMathOperator*{\argmin}{arg\,min}
+\DeclareMathOperator{\Var}{Var}
+\DeclareMathOperator{\SSE}{SSE}
+
+\theoremstyle{definition}
+\newtheorem{observation}{Observation}
+
+\title{\Large \SXE: Batch-Boosted, Holdout-Pruned, Sparsely Re-Weighted
+Histogram Trees\\[0.4em]
+\large A tree ensemble between the random forest and the gradient-boosted machine}
+
+\author{Alastair Rushworth}
+
+\date{%
+  \today\\[0.5em]
+  \small Prepared from the \code{sxe} repository at commit \code{eb97f58};
+  every measured figure traces to a script or artefact named in the text.
+}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent
+\SXE\ is a supervised tree-ensemble method for tabular data that occupies the
+space between two familiar constructions. A random forest grows many
+independent trees against the original target and averages them; a
+gradient-boosted decision tree (GBDT) grows one tree at a time against a
+running residual. \SXE\ grows a small \emph{batch} of independent, randomized
+trees at each boosting step, averages the batch, and applies that average as a
+single shrunken correction to the residual. The batch size is therefore a
+continuous dial between the two classical methods: a batch of one recovers
+stochastic gradient boosting, and a single batch spanning the whole budget
+recovers a random forest.
+
+Two further devices sit on top of that generator. First, because each tree is
+grown on a row subsample, the complement of that subsample is a private
+holdout, and \SXE\ uses it for reduced-error pruning at a strength drawn at
+random \emph{per tree}, so the ensemble deliberately spans a spectrum of
+bias--variance trade-offs rather than committing to one. Second, after
+generation the whole trajectory is re-fitted by a single non-negative lasso
+over batch-average prediction columns on a held-out fold; most batches receive
+weight exactly zero and are physically deleted from the model. At the shipped
+defaults this discards roughly 73--79\% of the trees that were grown.
+
+We give a complete description of the method and its implementation, and a
+head-to-head evaluation against a \emph{tuned} LightGBM on nine datasets with a
+common size-accounting rule applied to both sides. \SXE\ wins on accuracy on
+four datasets and loses on five; it carries the smaller model on five of nine,
+by up to $11.8\times$. Predictions are bit-identical across thread counts by
+construction. The clearest result in the study is negative: \SXE's shipped
+defaults give up a median 9.5\% error reduction to tuning where LightGBM's give
+up 3.3\%, so the competitive column is a tuned \SXE. We analyse why the
+accuracy wins and losses fall where they do --- the method is a
+variance-reduction device, and it wins where variance dominates and loses where
+bias does --- and we are explicit about what the evaluation does not establish.
+\end{abstract}
+
+\tableofcontents
+
+\newpage
+
+\section{Introduction}
+
+\subsection{Two constructions and the gap between them}
+
+Two ensemble constructions dominate supervised learning on tabular data, and
+they differ in how their members are related to one another.
+
+The \textbf{random forest} \cite{breiman2001rf} grows $M$ trees that are
+mutually independent given the data. Each sees a bootstrap sample of the rows
+and a random subset of features at each split, each is fitted to the
+\emph{original} target, and the prediction is their unweighted average.
+Independence is the point: averaging $M$ estimators with correlation $\rho$ and
+variance $\sigma^2$ gives variance $\rho\sigma^2 + (1-\rho)\sigma^2/M$, so
+decorrelating the members buys variance reduction that more members alone
+cannot. The construction is embarrassingly parallel, and its bias is the bias
+of a single deep tree --- which it does not attempt to reduce.
+
+The \textbf{gradient-boosted decision tree} \cite{friedman2001gbm} grows trees
+in strict sequence. Tree $m$ is fitted to the negative gradient of the loss at
+the current ensemble prediction --- for squared error, the residual --- and is
+added with a shrinkage factor $\nu$. Each member exists only as a correction to
+its predecessors. This attacks bias directly and is why GBDTs dominate tabular
+benchmarks \cite{grinsztajn2022}, but it is inherently sequential: tree $m{+}1$
+cannot begin until tree $m$ has updated the residual. Modern implementations
+\cite{ke2017lightgbm,chen2016xgboost} recover parallelism \emph{within} a tree
+--- across features and histogram bins --- rather than across trees.
+
+The gap between them is a design space, not a dichotomy. A boosting step need
+not be one tree. If a step consists of $B$ trees grown independently against
+the \emph{same} residual and then averaged, the step is a miniature random
+forest, the residual update happens once per step rather than once per tree,
+and the $B$ trees within a step can be grown concurrently. Nothing about
+gradient boosting requires $B=1$; the choice is historical.
+
+\subsection{What \SXE\ is}
+
+\SXE\ (``Sparse eXtra Ensembles'') takes that observation and builds three
+further ideas on it.
+
+\begin{enumerate}[leftmargin=*]
+\item \textbf{Batch boosting.} A boosting step grows $B$ randomized,
+subsampled trees in parallel against the current residual and applies their
+average as one shrunken correction. $B$ is a parameter (\code{batch\_size}),
+and it interpolates continuously between stochastic gradient boosting ($B=1$)
+and a random forest (one batch).
+
+\item \textbf{Per-tree holdout pruning at randomized strength.} Each tree is
+grown on a random fraction of the rows, so the complement is a holdout that
+tree has never seen. \SXE\ routes it through the grown tree and runs classical
+reduced-error pruning \cite{quinlan1987rep} bottom-up, collapsing any subtree
+that does not beat its own collapsed leaf on holdout squared error by a
+per-leaf penalty $\lambda$. Crucially $\lambda$ is drawn \emph{per tree} from a
+log-uniform distribution, so the ensemble contains members ranging from
+essentially unpruned to nearly stumps. No single bias--variance trade-off is
+chosen at fit time; the final stage arbitrates.
+
+\item \textbf{One-shot sparse non-negative re-weighting.} After generation,
+\SXE\ discards the uniform weights that boosting assigned and re-fits the
+trajectory with a non-negative lasso on a held-out fold, using one column per
+\emph{batch} (the batch's average prediction) rather than one per tree. Most
+coefficients come out exactly zero, and the corresponding batches are deleted
+from the model object. This is Friedman and Popescu's ISLE construction
+\cite{friedman2003isle} --- generate a dictionary of trees, then fit a sparse
+linear combination of them --- with Breiman's non-negativity constraint from
+stacked regressions \cite{breiman1996stacked}, applied at batch granularity.
+\end{enumerate}
+
+The per-tree randomization (depth, minimum leaf size, feature fraction,
+subsample rate, split rule, pruning strength all drawn independently for every
+member) is in the spirit of extremely randomized trees \cite{geurts2006et}: the
+method averages over hyperparameter draws instead of committing to a single
+setting. The histogram machinery --- quantile pre-binning, parent-minus-child
+histogram subtraction, exclusive feature bundling, optional leaf-wise growth
+--- follows LightGBM \cite{ke2017lightgbm}.
+
+\subsection{What the design is for}
+
+The method is not proposed as a general accuracy improvement over tuned GBDTs;
+Section~\ref{sec:results} shows it is not one. It targets three properties that
+follow from its structure:
+
+\begin{description}[leftmargin=1.5em,style=nextline]
+\item[Model size.] The lasso deletes most of the generated ensemble, and the
+survivors were already pruned against honest holdout data. Where this lands
+well the model is several times smaller than a tuned LightGBM's at comparable
+accuracy.
+\item[Reproducibility.] Every tree's random number stream is seeded from its
+\emph{index} in the generation order, never from which worker thread picked it
+up. The number of threads is therefore a pure performance knob: the same seed
+produces bit-identical predictions on 1 core or 10.
+\item[Parallel structure.] Trees within a batch are independent, so growth
+parallelises across trees, which sequential GBDT cannot do. Only the
+between-batch residual update is serial.
+\end{description}
+
+\subsection{Contributions}
+
+\begin{enumerate}[leftmargin=*,itemsep=2pt]
+\item A complete specification of the method (Section~\ref{sec:method}),
+including the exact split criterion, the pruning inequality and its degenerate
+case, the batch-boosting loop, and the weight fit.
+\item An implementation account (Section~\ref{sec:impl}) covering the hybrid
+histogram grower, the thread pool, the determinism argument, and the
+serialization format.
+\item A head-to-head evaluation against a tuned LightGBM on nine datasets under
+one size-accounting rule, with paired per-seed analysis
+(Section~\ref{sec:results}).
+\item A quantified negative result: the shipped defaults are substantially
+worse than the method (Section~\ref{sec:tuninggap}), with evidence about
+\emph{which} defaults are wrong.
+\item An analysis of where the method's accuracy wins and losses fall and why
+(Section~\ref{sec:discussion}), and an explicit account of what the study does
+not establish (Section~\ref{sec:limitations}).
+\end{enumerate}
+
+\section{Notation and setting}\label{sec:notation}
+
+Training data are $(x_i, y_i)_{i=1}^{n}$ with $x_i \in \mathbb{R}^p$. Write
+$X \in \mathbb{R}^{n\times p}$ for the design matrix and $y \in \mathbb{R}^n$
+for the target.
+
+The loss is squared error throughout. Regression minimises mean squared error
+directly. Binary classification is handled as regression on $y \in \{0,1\}$ ---
+the Brier-score reduction --- so leaf means are conditional-probability
+estimates and a squared-error split on 0/1 targets is equivalent to a Gini
+split up to constants. There is no logistic loss and there are no second-order
+(Newton) leaf values; Section~\ref{sec:limitations} returns to what this costs.
+Multiclass is a one-vs-rest reduction over the binary core.
+
+\SXE\ partitions the training data once, before anything else happens. A
+fraction $\rho_{\text{val}}$ (\code{validation\_fraction}, default $0.18$) is
+set aside as a validation fold $(X_{\text{val}}, y_{\text{val}})$ of size
+$n_{\text{val}}$; the remainder is the generation set on which all trees are
+grown. The validation fold is used for early stopping, for the weight fit, and
+for probability calibration.
+
+The fitted model has the form
+\begin{equation}\label{eq:model}
+\hat{y}(x) \;=\; \beta_0 \;+\; \sum_{b \in \mathcal{S}} w_b \cdot
+\underbrace{\frac{1}{B}\sum_{t \in \text{batch } b} T_t(x)}_{\text{batch mean}},
+\qquad w_b \ge 0,
+\end{equation}
+where each $T_t$ is a pruned regression tree, $B$ is the batch size, and
+$\mathcal{S}$ is the sparse set of batches surviving the weight fit. Members of
+batches outside $\mathcal{S}$ are deleted from the model object rather than
+merely zero-weighted, which is what makes the size claim about the artefact and
+not about a hypothetical pruning.
+
+\section{The method}\label{sec:method}
+
+Figure-free, the pipeline is: bin once $\rightarrow$ (optionally bundle binary
+columns) $\rightarrow$ generate a dictionary of trees by batch boosting, each
+tree self-pruned $\rightarrow$ fit non-negative sparse weights on the
+validation fold $\rightarrow$ delete everything with zero weight $\rightarrow$
+prune the bin table to the columns that survive.
+
+\subsection{Global quantile binning}\label{sec:binning}
+
+Every feature is quantile-binned once, up front, into at most 256 bins, and
+\emph{every} downstream stage --- split search, holdout routing, pruning,
+member prediction, the weight-fit design matrix --- operates on that single
+\code{uint8} matrix. There is no intermediate float matrix.
+
+Edges are estimated from a subsample of at most $50{,}000$ rows. For
+\code{max\_bins} $=256$ the code takes the interior points of
+$\text{linspace}(0,1,\cdot)$ as quantile levels, deduplicates the resulting
+edges (so a feature with few distinct values gets few bins), and maps values
+with \code{searchsorted(edges, x, side='right')}. The layout handed to the C++
+core is column-major, since the split search sweeps a feature at a time.
+
+Binning is not merely a speed device here. A uniform random threshold drawn on
+a binned feature is \emph{exactly} a random bin cut-point, so the
+extremely-randomized split rule of Section~\ref{sec:growth} composes with
+binning without approximation --- unlike a random threshold on raw values,
+which binning would have to round.
+
+\paragraph{Missing values.} At the reference commit, non-finite input is
+rejected at \code{fit} and \code{predict} and the user must impute upstream.
+Work in the repository's working tree (Section~\ref{sec:inflight}) reserves bin
+255 for \code{NaN} and lets the finite values occupy bins $0..254$. That scheme
+needs no support at all in the tree code: bin 255 routes like any other bin, so
+missing values travel with the largest values by default, and a split at bin
+254 --- which the exact-cut scan will find whenever it pays --- separates them.
+It is weaker than LightGBM's learned default direction, which can send missing
+either way at every node, but it is free.
+
+\subsection{Exclusive feature bundling}\label{sec:efb}
+
+\code{BinaryBundler} implements LightGBM-style exclusive feature bundling
+\cite{ke2017lightgbm} restricted to strictly binary columns, and is off by
+default (\code{bundle\_binary\_features}). Columns whose values lie in
+$\{0,1\}$ are ordered by descending nonzero count and greedily assigned to the
+first bundle whose used-row mask they do not intersect; conflict tolerance is
+zero and a bundle holds at most 250 members. A bundle of size $\ge 2$ becomes
+one small-integer column: $0$ if no member is active, else the $1$-indexed
+position of the active member. Singletons pass through unchanged.
+
+The encoding is lossless up to ordinality. A threshold split on a bundle
+selects a \emph{contiguous group} of the bundled categories rather than
+isolating one, which is weaker than a one-vs-rest split, but trees compose
+splits and the measured accuracy effect was nil. On Covertype this compresses
+54 features to 12 --- bundles of 5 wilderness and 39 soil indicators --- and
+cuts histogram work by roughly $4.5\times$.
+
+Exclusivity is verified on the training data and must hold at predict time; a
+prediction row that activates two members of one bundle would otherwise be
+silently encoded as the first of them, indistinguishable from a row where only
+that member is set. The current code raises, naming the offending row and
+columns.
+
+\subsection{Tree growth}\label{sec:growth}
+
+Trees are grown by the C++ core on the binned matrix. For a node containing
+$m$ rows with target sum $S$, a candidate split of feature $f$ at bin threshold
+$t$ (routing ``bin $\le t$'' left) is scored by the variance-reduction proxy
+\begin{equation}\label{eq:gain}
+G(f,t) \;=\; \frac{S_L^2}{n_L} \;+\; \frac{S_R^2}{n_R} \;-\; \frac{S^2}{m},
+\end{equation}
+where $(n_L, S_L)$ and $(n_R, S_R)$ are the counts and target sums of the two
+children. This is the standard reduction in sum of squares, written so that
+only prefix sums of the node's histogram are needed. A candidate is invalid if
+either child would fall below \code{min\_samples\_leaf}. A node stops splitting
+when it reaches the tree's depth cap, when $m < 2\,\code{min\_samples\_leaf}$,
+or when its target is numerically pure.
+
+\paragraph{Candidate generation.} At each node, $K$ distinct candidate features
+are drawn without replacement by a partial Fisher--Yates shuffle, with
+$K = \text{round}(\phi p)$ and $\phi \sim U(\code{feat\_lo}, \code{feat\_hi})$
+drawn \emph{once per tree}. For each candidate feature, cut-points are
+evaluated in one of two modes:
+\begin{description}[leftmargin=1.5em,style=nextline]
+\item[Exact (\code{splitter="best"}, the default).] A prefix scan over the
+feature's occupied bin range returns the maximiser of \eqref{eq:gain}.
+\item[Extremely randomized (\code{splitter="random"}).] \code{n\_thresholds}
+cut-points are drawn uniformly on the occupied bin range and only those are
+scored.
+\end{description}
+With a retained histogram both cost $O(\text{bin span})$, so the exact scan is
+essentially free; the choice is not about speed but about the trade between
+split quality and member diversity, and it is genuinely dataset-dependent ---
+the tuned configurations of Section~\ref{sec:tuninggap} chose random cuts on
+the high-dimensional and one-hot datasets and exact cuts elsewhere.
+
+\paragraph{Hybrid depth-wise growth with histogram subtraction.} Nodes with at
+least \code{hybrid\_min} rows (default 600) retain a full all-feature histogram
+of $p \times 256$ (count, sum) pairs. Candidates are then evaluated from prefix
+sums with no pass over the data at all. After the node's index range is
+partitioned in place, the \emph{smaller} child's histogram is built from data
+in $O(|\text{small}| \cdot p)$ and the larger child's is obtained by an
+in-place parent-minus-child subtraction, reusing the parent's buffer. At most
+$\text{depth}+1$ buffers are live per thread and they are pooled.
+
+Children below \code{hybrid\_min} fall back to a second grower that builds a
+single 256-bin histogram per candidate feature with touched-bin clearing, and
+so pays no $p\times256$ clearing cost on small nodes. The threshold trades one
+cost against the other.
+
+\begin{observation}[\code{hybrid\_min} is a pure performance knob]
+Both growers select splits identically but draw from one shared per-tree random
+stream, so the order in which they recurse determines which node a given random
+draw lands on. Both therefore recurse \emph{smaller child first}. Without that,
+changing \code{hybrid\_min} --- ostensibly a speed setting --- would silently
+change the fitted model. The repository tests this invariance rather than
+asserting it.
+\end{observation}
+
+\paragraph{Leaf-wise growth.} Setting \code{max\_leaf\_nodes} switches to
+best-first growth in LightGBM's style: a max-heap keyed on gain holds pending
+leaves with their histograms and precomputed best splits, the highest-gain leaf
+is split, children are obtained by the same fill-smaller-and-subtract step, and
+growth stops at the leaf budget. Exported node ids satisfy
+$\text{parent} < \text{children}$ in both modes, which is what makes the
+bottom-up passes below valid without a separate traversal order.
+
+\paragraph{Per-tree randomization.} Every tree independently draws:
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+Quantity & Distribution \\
+\midrule
+\code{max\_depth} & uniform over \code{max\_depth\_choices} ($0 \Rightarrow$ capped at 64) \\
+\code{min\_samples\_leaf} & log-uniform on \code{min\_samples\_leaf\_range} \\
+feature fraction $\phi$ & uniform on \code{max\_features\_range} \\
+row subsample rate & uniform on \code{subsample\_range}, sampled without replacement \\
+pruning strength $\lambda$ & log-uniform on \code{prune\_strength\_range} \\
+\bottomrule
+\end{tabular}
+\end{center}
+No two members of a batch share hyperparameters. This is the ExtraTrees idea
+carried up a level: rather than choosing one configuration, the ensemble
+averages over the draw.
+
+\subsection{Holdout reduced-error pruning}\label{sec:pruning}
+
+Each tree is grown on a subsample of rate drawn in $[0.4, 0.75]$ by default, so
+25--60\% of the rows are \emph{not} used to grow it. These are that tree's
+private holdout, and they are free --- the out-of-bag idea \cite{breiman1996oob}
+applied to pruning rather than to scoring.
+
+After growth, the holdout rows are routed through the tree once, accumulating
+$(n_h, \sum y, \sum y^2)$ at \emph{every} node on each row's root-to-leaf path.
+A single bottom-up pass --- descending node id, valid because ids are
+pre-order --- then computes, for each node, the holdout sum of squared errors
+that collapsing that node to a leaf would incur:
+\begin{equation}\label{eq:sseleaf}
+\SSE_{\text{leaf}} \;=\; \sum_h y^2 \;-\; 2\mu \sum_h y \;+\; n_h \mu^2,
+\end{equation}
+where $\mu$ is the node's \emph{training} mean --- the value the collapsed leaf
+would actually predict. The node is collapsed if and only if
+\begin{equation}\label{eq:prune}
+\SSE_{\text{leaf}} \;\le\; \SSE_{\text{subtree}} \;+\;
+\lambda\,\hat\sigma^2_h\,(L_{\text{subtree}} - 1),
+\end{equation}
+where $\SSE_{\text{subtree}}$ is the sum of the (possibly already collapsed)
+children's values, $L_{\text{subtree}}$ is the subtree's post-collapse leaf
+count, and $\hat\sigma^2_h$ is the holdout variance at the root, which makes
+$\lambda$ scale-free.
+
+The interpretation is direct. At $\lambda = 0$ the rule removes exactly those
+splits that do not help on data the tree has never seen --- dead wood. As
+$\lambda$ grows, each additional leaf must pay for itself at a rate of
+$\lambda\hat\sigma^2_h$, giving a nested sequence of increasingly aggressive
+subtrees: a holdout analogue of weakest-link cost-complexity pruning
+\cite{breiman1984cart}, but with the complexity penalty evaluated against
+honest data rather than resubstitution error.
+
+Each tree emits exactly one member, pruned at its own
+$\lambda \sim \text{log-}U(\lambda_{\text{lo}}, \lambda_{\text{hi}})$. Pruning
+diversity therefore lives \emph{across} trees, and the weight fit of
+Section~\ref{sec:weights} decides how much of each strength the model wants.
+Collapsed nodes are exported as leaves carrying their training means.
+
+\begin{observation}[The small-holdout degeneracy]\label{obs:guard}
+If the subsample rate approaches 1, the holdout is nearly empty and many
+subtrees are visited by no holdout row at all. For such a subtree both sides of
+\eqref{eq:prune} are $0 \le 0 + \lambda\hat\sigma_h^2(L-1)$, which is satisfied
+trivially, and the tree collapses --- in the worst case to a stump. \SXE\
+guards this by emitting the tree unpruned whenever the holdout has fewer than
+$\max(50, n/50)$ rows. The fix was worth $0.4504 \to 0.4437$ RMSE on California
+housing in the original measurement, and it is what makes mild-subsampling
+configurations viable at all.
+\end{observation}
+
+\subsection{Batch-boosted dictionary generation}\label{sec:boost}
+
+The generation loop runs entirely in the C++ core. Let $r$ denote the residual
+on the generation set and $F_{\text{val}}$ the running prediction on the
+validation fold.
+
+\begin{algorithm}[H]
+\caption{Batch boosting (\code{Ensemble::boost})}
+\begin{algorithmic}[1]
+\State $r \gets y$; \quad $F_{\text{val}} \gets 0$; \quad
+$\text{best} \gets \infty$; \quad $\text{bad} \gets 0$
+\For{$b = 1, \dots, \code{max\_iter}$}
+  \State \textbf{in parallel} for $t = 1, \dots, B$:
+  \Statex \hspace{2em} seed tree $(b,t)$ from its index; draw its hyperparameters
+  \Statex \hspace{2em} draw a row subsample; grow a tree on $(X, r)$
+  \Statex \hspace{2em} route the complement; prune by \eqref{eq:prune} at its own $\lambda$
+  \Statex \hspace{2em} evaluate $T_t$ on the generation rows and on $X_{\text{val}}$
+  \State $r \gets r - \dfrac{\nu}{B}\displaystyle\sum_{t=1}^{B} T_t(X)$
+  \Comment{one shrunken correction per batch}
+  \State $F_{\text{val}} \gets F_{\text{val}} + \dfrac{\nu}{B}\displaystyle\sum_{t=1}^{B} T_t(X_{\text{val}})$
+  \State $\text{mse} \gets \|y_{\text{val}} - F_{\text{val}}\|^2 / n_{\text{val}}$
+  \If{$\text{mse} < \text{best} - \tau$} $\text{best} \gets \text{mse}$;\ $\text{bad} \gets 0$
+  \ElsIf{$\texttt{++bad} \ge \code{n\_iter\_no\_change}$} \textbf{break}
+  \EndIf
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+The early-stopping tolerance is $\tau = \code{tol} \cdot \Var(y_{\text{val}})$,
+so it is expressed in units of the target's variance rather than in absolute
+error. The residual update is the only serial dependency in the loop; the $B$
+tree constructions inside a batch touch no shared mutable state.
+
+Two properties of the loop are worth naming. First, trees fit residuals, and
+their holdout pruning is evaluated against the same residual target --- which
+is the correct objective at that stage, since the tree's job is to explain
+what remains. Second, the batch average $\frac{1}{B}\sum_t T_t$ is itself a
+small random forest, so each boosting step is a shrunken correction built from
+a variance-reduced estimate rather than from a single high-variance tree. This
+is the sense in which $B$ dials between the two classical methods:
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+\code{batch\_size} & Recovers & Character \\
+\midrule
+$1$ & stochastic gradient boosting & one tree per residual update \\
+$10$--$16$ (default range) & \SXE & a mini-forest per residual update \\
+$\to$ whole budget & random forest & one update, everything fitted to $y$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Empirically $B \in [4,16]$ preserved almost all of boosting's accuracy while
+exposing the parallel width.
+
+\subsection{The sparse non-negative weight fit}\label{sec:weights}
+
+Generation produces up to $\code{max\_iter} \times B$ trees with uniform
+implied weights $\nu/B$. \SXE\ discards those weights and re-fits.
+
+Let $P \in \mathbb{R}^{n_{\text{val}} \times M}$ hold every member's prediction
+on the validation fold. Columns are averaged within batches,
+$P_b = \frac{1}{B}\sum_{t \in b} P_{\cdot t}$, giving one column per batch;
+this averaging happens inside the C++ core so the design matrix is never
+materialised at member granularity. The weights solve a positive elastic net
+with intercept --- a pure lasso at the default \code{l1\_ratio}$=1$:
+\begin{equation}\label{eq:lasso}
+\min_{w \ge 0,\; \beta_0} \;
+\frac{1}{2 n_{\text{val}}} \big\| y_{\text{val}} - \beta_0 - P_b w \big\|_2^2
+\;+\; \alpha \|w\|_1 .
+\end{equation}
+The regularisation strength $\alpha$ is chosen by 3-fold cross-validation over
+a path of 20 values, with Gram matrices precomputed --- which took the fit from
+roughly 20\,s to 1--5\,s at thousands of columns and to 0.02--0.3\,s at
+hundreds. Batches whose weight is zero are deleted; each surviving member
+receives weight $w_b / B$, and $\beta_0$ becomes the model intercept. If the
+cross-validated solution collapses entirely to the intercept, a tiny-$\alpha$
+positive fit is substituted so the model remains an ensemble rather than a
+constant.
+
+Four design choices deserve justification.
+
+\paragraph{Why a lasso at all.} By the stagewise--lasso correspondence
+\cite{efron2004lars,hastie2007forward}, forward stagewise fitting with
+infinitesimal steps traces the lasso path. The boosting trajectory is exactly
+such a stagewise fit, so a lasso over the generated columns is a convex stand-in
+for the greedy procedure that produced them --- it can express the same
+solutions, and it can express sparser ones the greedy fit passed through and
+never returned to. This is ISLE \cite{friedman2003isle}.
+
+\paragraph{Why non-negative.} Breiman's stacked regressions
+\cite{breiman1996stacked} found that constraining combination weights to be
+non-negative yields sparser and markedly more stable solutions than
+unconstrained least squares. It also prevents the pathology where two batches
+acquire large opposing weights that cancel: every retained batch must
+contribute in the direction it was fitted.
+
+\paragraph{Why on held-out data.} Selection is deliberately on the validation
+fold. Fitted in-sample, the deepest and least-pruned members would absorb
+everything and the pruning diversity of Section~\ref{sec:pruning} would be
+wasted.
+
+\paragraph{Why batch-average columns.} Cost. Per-member columns made the fit
+explode to $\approx 7$\,s at thousands of columns; batch columns made it
+$0.02$--$0.3$\,s with no measured accuracy change, and the fit's cost becomes
+independent of the tree count. The price is granularity: a batch is retained or
+dropped as a unit, and the model cannot express ``keep three of these ten
+trees''.
+
+\begin{observation}[The lasso compresses; it does not correct]
+A diagnostic comparing the fitted weights against the raw uniform generation
+weights $\nu/B$ found test-set-equal accuracy with roughly $10\times$
+compression. The weight fit's role is therefore \emph{trajectory pruning} ---
+deciding which steps of the boosting path are redundant --- rather than
+repairing the direction of the fit. Generation decides where each batch points;
+the lasso decides how much of it to keep, and whether to keep it at all.
+\end{observation}
+
+Measured at the reference defaults on two datasets (script in
+Section~\ref{sec:repro}):
+
+\begin{center}
+\begin{tabular}{lrrrr}
+\toprule
+Dataset & Batches run & Trees grown & Trees kept & Kept \\
+\midrule
+California housing & 120 & 1{,}200 & 250 & 20.8\% \\
+Friedman1 + noise & 104 & 1{,}040 & 280 & 26.9\% \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Prediction, classification and calibration}\label{sec:predict}
+
+Prediction routes binned rows through the retained trees and forms
+$\beta_0 + \sum_j w_j T_j(x)$, parallelised over rows.
+
+Binary classification predicts the same raw score. Because the score is a
+weighted combination of 0/1 leaf means it is approximately a probability but
+not a calibrated one, so \SXE\ fits a Platt sigmoid \cite{platt1999} on the
+validation fold: $p = \sigma(a\,s + b)$ by maximum likelihood against Platt's
+smoothed targets $(N_+{+}1)/(N_+{+}2)$ and $1/(N_-{+}2)$, which keep the
+optimum finite when the fold happens to be separable. The smoothing is applied
+by giving every observation both labels with weights $t$ and $1-t$, so an
+ordinary logistic solver optimises the smoothed objective exactly. If the fold
+cannot identify a calibration --- one class only, a constant score, or a fitted
+map that is non-increasing --- the calibrator is dropped and the raw score is
+clipped instead, so a bad fit can never reorder the scores.
+
+Multiclass is one-vs-rest: one complete ensemble per class, with per-class
+scores normalised to sum to one. This is a reduction, not a native objective,
+and it costs a full ensemble per class --- on the 26-class Letter dataset, 26
+ensembles.
+
+\subsection{Determinism}\label{sec:determinism}
+
+The random stream for the tree at batch $b$, slot $t$ is seeded as
+\begin{equation}
+\text{seed}_{b,t} \;=\; \texttt{splitmix64}\big(s \;+\; \texttt{0x9E3779B9} \cdot (bB + t + 1)\big),
+\end{equation}
+a function of the tree's \emph{index} only. Nothing about which worker thread
+executes the tree, or in what order the pool drains its queue, enters the
+stream. Combined with the smaller-child-first recursion of both growers, this
+gives:
+
+\begin{itemize}[leftmargin=1.5em,itemsep=1pt]
+\item identical models across \code{n\_jobs} settings;
+\item identical models across \code{hybrid\_min} settings;
+\item identical models across repeated runs.
+\end{itemize}
+
+All three are covered by tests in the repository (\code{tests/test\_determinism.py}),
+not merely asserted. The invariance is \emph{within} a platform. Per-tree
+randomness is drawn through \code{std::uniform\_int\_distribution} and
+\code{std::uniform\_real\_distribution}, whose algorithms are
+implementation-defined by the C++ standard, so libstdc++, libc++ and MSVC
+produce different sequences from the same seeded \code{mt19937\_64} and
+therefore grow different trees. Making seeds portable would require replacing
+the standard distributions with fixed implementations; the repository records
+this as an open decision.
+
+\subsection{Serialization and model size}\label{sec:size}
+
+Two distinct quantities must be kept apart.
+
+\paragraph{The portable accounting formula.} For comparing libraries, size is
+computed identically for both sides from the tree structure alone: 13 bytes per
+internal node (feature 4, threshold 1, left 4, right 4), 8 bytes per leaf
+(value), plus the bin table a binned model needs to map raw features to bins at
+predict time ($255$ edges $\times$ 8 bytes per feature the model indexes).
+Trees are full binary, so internal nodes $=$ leaves $-$ trees. This formula is
+used in Section~\ref{sec:results} for both \SXE\ and LightGBM precisely because
+it special-cases neither.
+
+\paragraph{The format \SXE\ actually writes.} \code{Ensemble::serialize} stores
+only what prediction reads. Three fields that a naive layout would store are
+recovered or discarded instead:
+\begin{itemize}[leftmargin=1.5em,itemsep=1pt]
+\item \emph{left child}: the exporter emits nodes in pre-order, pushing right
+then left, so a node's left child is always the next id. It is recomputed on
+load.
+\item \emph{value on internal nodes}: prediction reads a value only at a leaf.
+\item \emph{gain}: it existed for \code{feature\_importances\_}, which is now
+accumulated once at fit time into a length-$p$ vector.
+\end{itemize}
+What remains is 9 bytes per internal node, 8 per leaf, and one bit per node
+recording which is which. The bin table is additionally pruned to the columns
+the retained trees actually index; on Madelon at defaults the model splits on
+61 of 500 features and was carrying 421\,kB of quantile edges for the other
+439.
+
+An earlier version of this format wrote 29 bytes per node --- storing
+\code{gain} everywhere, \code{feat}/\code{thr}/\code{left}/\code{right} on
+leaves and \code{val} on internal nodes --- so the advertised size was
+$2.9\times$ smaller than the artefact. That has been corrected. Measured at the
+reference defaults:
+
+\begin{center}
+\begin{tabular}{lrrr}
+\toprule
+Dataset & \code{serialize()} & Portable formula & Ratio \\
+\midrule
+California housing & 138{,}195 B & 161{,}495 B & $0.86\times$ \\
+Friedman1 + noise & 247{,}861 B & 294{,}224 B & $0.84\times$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent The real format is now \emph{smaller} than the portable formula the
+benchmark charges it, so the size column of Section~\ref{sec:results} is
+conservative for \SXE\ on the structure term. It remains a formula rather than
+a byte count for LightGBM.
+
+\subsection{Complexity}\label{sec:complexity}
+
+Let $n_s$ be a tree's subsample size, $n_h$ its holdout size, $d$ its depth,
+and $M_b$ the number of batch columns.
+
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+Stage & Cost \\
+\midrule
+Growth (with subtraction) & $O(n_s (p + d))$ per tree \\
+In-place partitioning & $O(n_s d)$ per tree \\
+Holdout routing & $O(n_h d)$ per tree \\
+Pruning pass & $O(\text{nodes})$ per tree \\
+Residual/validation update & $O((n + n_{\text{val}}) d)$ per tree \\
+Weight fit & $O(n_{\text{val}} M_b^2)$ Gram, then coordinate descent on $M_b \times M_b$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The $O(n_s p)$ term in growth is dominated by the smaller-child histogram fills,
+which sum to at most $n_s p / 2$ per level because the larger child is always
+obtained by subtraction. Measured single-core grower throughput on Covertype
+was $\approx 27.8$k leaves/s against LightGBM's $\approx 13.9$k, so wall-clock
+differences between the libraries come from \emph{how much structure each
+method builds}, not from per-leaf cost.
+
+\section{Implementation}\label{sec:impl}
+
+\subsection{Layout}
+
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+Path & Role \\
+\midrule
+\code{src/sxe/\_core.cpp} & C++17 core: growers, pruning, boosting, prediction, serialization \\
+\code{src/sxe/estimator.py} & \code{SXERegressor}, \code{SXEClassifier} \\
+\code{src/sxe/binning.py} & \code{QuantileBinner} \\
+\code{src/sxe/bundling.py} & \code{BinaryBundler} \\
+\code{benchmarks/} & the head-to-head suite and its committed outputs \\
+\code{reference/} & the original ctypes prototype, kept as a parity oracle \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The division of labour is deliberate: everything that runs once per fit and is
+cheap (binning, bundling, the train/validation split, the lasso) stays in
+Python where scikit-learn's implementations are already good; everything that
+runs once per tree or once per row is in C++.
+
+\subsection{Threading}
+
+Growth and prediction use a hand-rolled \code{std::thread} pool rather than
+OpenMP, so there is no runtime to bundle --- notably no \code{libomp} step for
+macOS users --- and \code{n\_jobs} is explicit. The pool holds
+$\text{threads}-1$ workers and uses the calling thread as the last one. Work is
+distributed by an atomic counter, so scheduling is dynamic; this is safe for
+determinism precisely because each work item's random stream is index-derived
+(Section~\ref{sec:determinism}). The first exception thrown by any worker is
+captured, the counter is poisoned so remaining workers stop promptly, and the
+exception is rethrown on the calling thread. The GIL is released for the whole
+generation loop.
+
+\code{n\_jobs=None} means \emph{all cores}, matching other gradient-boosting
+libraries rather than scikit-learn's single-core default; negative values follow
+the joblib convention.
+
+\subsection{scikit-learn conformance}
+
+\code{SXERegressor} and \code{SXEClassifier} pass
+\code{sklearn.utils.estimator\_checks.check\_estimator} in full, so they compose
+with \code{Pipeline}, \code{GridSearchCV}, \code{cross\_val\_score} and
+\code{joblib} without adapters. Fitted models pickle and deep-copy --- the trees
+travel through the serialization format of Section~\ref{sec:size} --- so they
+survive the round trip into joblib workers. Parameter names follow
+scikit-learn's \code{HistGradientBoosting*} vocabulary wherever the concepts
+match. The repository's test suite (105 tests at the time of writing) covers
+the API surface, determinism, persistence, multiclass, calibration, validation
+and output quality.
+
+\section{Experimental setup}\label{sec:setup}
+
+\subsection{Datasets}
+
+Nine datasets, chosen so that each stresses a different property --- including
+several that stress properties \SXE\ does not have.
+
+\begin{center}
+\begin{tabular}{llll}
+\toprule
+Dataset & Shape & Task & What it tests \\
+\midrule
+California housing & $20{,}640 \times 8$ & regression & smooth low-dimensional signal, small $n$ \\
+Friedman1 + 20 noise & $25{,}000 \times 25$ & regression & known signal buried in noise \\
+Superconductivity & $21{,}263 \times 81$ & regression & many correlated informative features \\
+Covertype 2-vs-rest & $30{,}000 \times 54$ & binary & the original reference point \\
+Covertype 2-vs-rest, full & $581{,}012 \times 54$ & binary & large $n$, where GBDT scaling shows \\
+Adult & $48{,}842 \times 14$ & binary & categoricals (cardinality 2--41), missing values \\
+Bank marketing & $45{,}211 \times 16$ & binary & categoricals (cardinality 2--12) \\
+Letter recognition & $20{,}000 \times 16$ & 26-class & the cost of the one-vs-rest reduction \\
+Madelon & $2{,}600 \times 500$ & binary & $p \gg n$, mostly irrelevant features \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Five seeds each, except Covertype-full and Letter at three. The seed drives the
+80/20 train/test split (stratified for classification), the model, and --- for
+Friedman1 --- the data itself.
+
+\subsection{Protocol}
+
+\paragraph{Both libraries are tuned.} A win over a misconfigured baseline
+establishes nothing, so both libraries are tuned per dataset by random search
+over a fixed space with the same number of draws (10--24, larger where a fit is
+cheap). Draw zero is always the library's own defaults, so a tuned row cannot
+be worse than its default row on the selection fold. The search runs once per
+dataset on seed 0 and the selected configuration is reused across seeds, so
+neither library tunes against a seed it is scored on. Selected configurations
+are committed to \code{benchmarks/tuned\_configs.json}.
+
+\paragraph{Common preprocessing.} Both libraries receive the same matrix:
+categorical columns ordinal-coded, numeric missing values median-imputed from
+the training split. This is necessary because \SXE\ at the reference commit
+rejects non-finite input and has no categorical handling. A separate
+\code{LightGBM-native} row runs LightGBM on raw \code{NaN}s with declared
+categorical columns, which prices what the workaround costs.
+
+\paragraph{One size rule, both sides.} Size is the portable formula of
+Section~\ref{sec:size} applied to both libraries' structure counts.
+
+\paragraph{Timing.} Wall-clock on one 10-core laptop; each library is reported
+at its own best thread count. On this machine LightGBM's best is one thread on
+seven of nine datasets and \SXE's is all cores on all nine.
+
+\paragraph{One asymmetry, in LightGBM's favour.} LightGBM's early-stopping fold
+doubles as its selection fold. \SXE\ early-stops on a fold carved from the
+training half and is therefore selected on data it has not seen.
+
+\subsection{Provenance}
+
+Every figure in Section~\ref{sec:results} is recomputed directly from
+\code{benchmarks/results\_suite.csv}, the committed raw output of
+\code{benchmarks/bench\_suite.py}. Accuracy and structure are read at the lowest
+thread count so that repeated thread settings do not double-count;
+time is the mean at each library's best thread count.
+
+\section{Results}\label{sec:results}
+
+\subsection{Head-to-head, both tuned}
+
+\begin{table}[h]
+\centering
+\small
+\caption{Both libraries tuned. Mean $\pm$ standard deviation across seeds.
+Bold marks the better mean.}
+\begin{tabular}{llccrrrr}
+\toprule
+& & \multicolumn{2}{c}{Accuracy} & \multicolumn{2}{c}{Size (MB)} & \multicolumn{2}{c}{Best fit (s)} \\
+\cmidrule(lr){3-4}\cmidrule(lr){5-6}\cmidrule(lr){7-8}
+Dataset & Metric & LightGBM & \SXE & LGBM & \SXE & LGBM & \SXE \\
+\midrule
+California      & rmse $\downarrow$ & \textbf{0.4409} $\pm$ 0.0095 & 0.4480 $\pm$ 0.0097 & 2.845 & \textbf{0.241} & 2.22 & \textbf{1.40} \\
+Friedman1+noise & rmse $\downarrow$ & 1.0695 $\pm$ 0.0112 & \textbf{1.0557} $\pm$ 0.0166 & \textbf{0.526} & 0.993 & \textbf{1.50} & 2.00 \\
+Superconduct    & rmse $\downarrow$ & \textbf{9.3313} $\pm$ 0.3171 & 9.6685 $\pm$ 0.2807 & 5.766 & \textbf{1.253} & 13.33 & \textbf{9.63} \\
+Covertype 30k   & auc $\uparrow$    & 0.9547 $\pm$ 0.0031 & \textbf{0.9590} $\pm$ 0.0026 & \textbf{1.092} & 3.545 & \textbf{1.32} & 8.32 \\
+Covertype full  & auc $\uparrow$    & \textbf{0.9977} $\pm$ 0.0001 & 0.9946 $\pm$ 0.0001 & \textbf{10.508} & 14.448 & \textbf{50.31} & 82.11 \\
+Adult           & auc $\uparrow$    & \textbf{0.9305} $\pm$ 0.0016 & 0.9240 $\pm$ 0.0020 & 0.489 & \textbf{0.443} & 1.72 & \textbf{1.69} \\
+Bank marketing  & auc $\uparrow$    & 0.9338 $\pm$ 0.0017 & \textbf{0.9354} $\pm$ 0.0021 & 0.202 & \textbf{0.181} & \textbf{1.02} & 2.24 \\
+Letter (26)     & acc $\uparrow$    & \textbf{0.9661} $\pm$ 0.0018 & 0.9629 $\pm$ 0.0003 & \textbf{5.109} & 13.564 & 67.61 & \textbf{33.85} \\
+Madelon         & auc $\uparrow$    & 0.8873 $\pm$ 0.0089 & \textbf{0.9031} $\pm$ 0.0075 & 1.364 & \textbf{1.036} & \textbf{3.66} & 5.96 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent
+\textbf{Accuracy: four to \SXE, five to LightGBM. Size: five to \SXE, four to
+LightGBM. Time: three to \SXE, six to LightGBM.} No axis is a systematic win.
+
+\subsection{Paired analysis}
+
+Means and standard deviations across seeds understate what a paired comparison
+can say, because both libraries see the same split at each seed. Table
+\ref{tab:paired} reports the per-seed difference.
+
+\begin{table}[h]
+\centering
+\small
+\caption{Paired per-seed differences, \SXE\ minus LightGBM. $t$ is the mean
+difference in units of its own standard deviation; positive $t$ favours \SXE\
+for AUC and accuracy, negative $t$ favours \SXE\ for RMSE.}
+\label{tab:paired}
+\begin{tabular}{llrrrl}
+\toprule
+Dataset & Metric & Mean diff & sd & $|t|$ & Verdict \\
+\midrule
+Covertype full  & auc  & $-0.00313$ & 0.00005 & 57.8 & LightGBM, decisive (0/3 seeds) \\
+Adult           & auc  & $-0.00645$ & 0.00066 & 9.8  & LightGBM, clear (0/5) \\
+Covertype 30k   & auc  & $+0.00436$ & 0.00088 & 5.0  & \SXE, clear (5/5) \\
+Superconduct    & rmse & $+0.33720$ & 0.10956 & 3.1  & LightGBM, clear (0/5) \\
+Madelon         & auc  & $+0.01574$ & 0.00661 & 2.4  & \SXE, clear (5/5) \\
+Letter          & acc  & $-0.00317$ & 0.00166 & 1.9  & LightGBM, suggestive (0/3) \\
+Bank marketing  & auc  & $+0.00157$ & 0.00090 & 1.7  & \SXE, suggestive (5/5) \\
+California      & rmse & $+0.00712$ & 0.00629 & 1.1  & within noise (0/5) \\
+Friedman1+noise & rmse & $-0.01380$ & 0.01265 & 1.1  & within noise (4/5) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Two \SXE\ wins (Covertype-30k, Madelon) and three LightGBM wins (Covertype-full,
+Adult, Superconductivity) are clear. Bank marketing and Letter are suggestive
+but not decisive. California and Friedman1 are within seed-to-seed spread,
+though the sign is consistent across seeds in each case. Note that the sign of
+the mean difference is consistent with the win count on every dataset, so no
+result is an artefact of one outlying seed.
+
+\subsection{Model size}
+
+Size is smaller for \SXE\ on five of nine, and where it wins it wins large:
+$11.8\times$ on California, $4.6\times$ on Superconductivity. But the
+mechanism deserves stating plainly, because it is not ``\SXE\ builds smaller
+models''. Neither random search penalises size. Both columns therefore report
+where an accuracy-driven search happened to land, and LightGBM's search drifts
+to very large models --- 135k leaves on California, 267k on Superconductivity,
+497k on Covertype-full --- whenever that buys it anything at all. Where \SXE\
+loses on size it loses on structure it genuinely spends: 164k leaves on
+Covertype-30k, and 650k on Letter, where the one-vs-rest reduction pays for 26
+separate ensembles.
+
+\subsection{What tuning buys each library}\label{sec:tuninggap}
+
+The gap between a library's tuned and default rows is the measurable form of
+``does this need tuning''. Table~\ref{tab:tuning} reports the error reduction
+from default to tuned, where error is RMSE for regression and $1 - \text{metric}$
+for classification.
+
+\begin{table}[h]
+\centering
+\small
+\caption{Error reduction from each library's defaults to its tuned
+configuration. Larger means the defaults were further from what the library can
+do.}
+\label{tab:tuning}
+\begin{tabular}{lrrr}
+\toprule
+Dataset & \SXE & LightGBM & Ratio \\
+\midrule
+California      & 4.4\%  & 1.0\%  & $4.3\times$ \\
+Friedman1+noise & 1.9\%  & 3.3\%  & $0.6\times$ \\
+Superconduct    & 11.8\% & 2.4\%  & $5.0\times$ \\
+Covertype 30k   & 50.4\% & 8.2\%  & $6.2\times$ \\
+Covertype full  & 82.8\% & 61.4\% & $1.3\times$ \\
+Adult           & 4.5\%  & 2.7\%  & $1.7\times$ \\
+Bank marketing  & 2.6\%  & 0.9\%  & $2.9\times$ \\
+Letter          & 36.8\% & 6.7\%  & $5.5\times$ \\
+Madelon         & 9.5\%  & 3.6\%  & $2.6\times$ \\
+\midrule
+\textbf{median} & \textbf{9.5\%} & \textbf{3.3\%} & $\mathbf{2.9\times}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{\SXE\ gains more from tuning on eight of nine datasets.} This is the
+clearest result in the study and it is negative. It is a statement about the
+shipped defaults rather than about the method --- the tuned column of
+Table~\ref{tab:paired} is competitive, the default one is not --- but a user's
+first fit is what they actually get, so the distinction is cold comfort.
+
+The winning configurations say specifically what is wrong. Not one of the nine
+used the default \code{max\_depth\_choices} $=(4,5,6,7,8)$: five chose
+$(8,10,12)$ or $(10,12,14)$ and four chose leaf-wise growth with 63--127
+leaves. \code{max\_iter} selected the top of its search range on seven of nine
+and \code{batch\_size} on six. Three of the knobs that matter most therefore
+ran into the ceiling of the search space, which means the defaults are not
+merely mistuned but \emph{systematically build too small a model}, and the true
+optimum lies beyond what was searched.
+
+\subsection{What the missing features cost}
+
+\begin{center}
+\begin{tabular}{lrrr}
+\toprule
+Dataset & LightGBM (shared matrix) & LightGBM-native & Difference \\
+\midrule
+Adult          & 0.9305 auc & 0.9304 auc & $-0.0001$ \\
+Bank marketing & 0.9338 auc & 0.9351 auc & $+0.0013$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Native categorical handling and native missing-value handling buy LightGBM
+almost nothing on these two datasets. \SXE's gap on Adult ($-0.0065$ AUC) is
+therefore a \emph{model} gap, not an encoding gap --- a useful negative result,
+since it says that adding native categorical support would not close it. What
+the missing features cost is user effort: the preprocessing must happen, and
+today the user writes it.
+
+\subsection{Ablations}
+
+The following deltas were measured on the original prototype, under
+Linux/libstdc++, single-seed. They are retained as the \emph{relative} evidence
+for each design decision --- the direction and rough magnitude of each change
+--- and will not reproduce exactly against Section~\ref{sec:results}, which is
+a multi-seed re-measurement on macOS/libc++.
+
+\begin{center}
+\begin{tabular}{p{0.30\textwidth}p{0.63\textwidth}}
+\toprule
+Change & Effect \\
+\midrule
+Multi-round boosting vs.\ a single-round dictionary
+& The single-round dictionary lands at random-forest level; the residual rounds
+supply essentially all accuracy beyond bagging. Boosted multi-round beat RF
+everywhere (Friedman 1.088 vs.\ 1.443 RMSE) at 20--40$\times$ smaller models. \\
+\addlinespace
+Holdout pruning replacing a cost-complexity approximation
+& Covertype AUC $0.9480 \to 0.9528$, alongside 5--10$\times$ faster growth from
+the move to C++. Consistent with pruning decisions made against genuinely
+held-out data. \\
+\addlinespace
+Histogram subtraction
+& $\approx 1.6\times$ on growth. \\
+\addlinespace
+Exclusive feature bundling
+& A further $\approx 2.4\times$ on Covertype at unchanged accuracy. \\
+\addlinespace
+Batch boosting + batch-group lasso (v2 $\to$ v3)
+& Friedman flipped to a win on all three axes. Per-member lasso columns cost
+$\approx 7$\,s at thousands of columns; batch columns made the fit
+0.02--0.3\,s with no accuracy change. \\
+\addlinespace
+The small-holdout guard (Obs.~\ref{obs:guard})
+& California $0.4504 \to 0.4437$ RMSE. \\
+\addlinespace
+Leaf-wise growth
+& Did not break the California accuracy plateau (63 leaves $\approx$ depth-wise
+best, 31 leaves worse) --- evidence that the residual gap there is not about
+tree shape. \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Discussion}\label{sec:discussion}
+
+\subsection{Why the wins and losses fall where they do}
+
+Every device in \SXE\ is a variance-reduction device. Averaging $B$ independent
+trees per step reduces the variance of each correction. Randomizing depth, leaf
+size, feature fraction and subsample rate decorrelates the members.
+Reduced-error pruning against a private holdout removes structure that does not
+generalise. The non-negative lasso deletes whole steps of the trajectory that
+do not pay on held-out data. There is no corresponding device for bias: the
+loss is squared error, leaf values are training means, and there is no Newton
+step.
+
+The results follow that structure closely. \SXE\ wins where variance dominates
+the error:
+\begin{itemize}[leftmargin=1.5em,itemsep=1pt]
+\item \textbf{Madelon} ($p \gg n$, 2{,}600 rows, 500 features, mostly
+irrelevant) --- the regime where a single greedy learner overfits the
+irrelevant features and averaging over feature subsets pays most. \SXE\ wins by
+2.4 sd on 5/5 seeds, with a model $1.3\times$ smaller.
+\item \textbf{Covertype-30k} --- a subsampled problem where the same argument
+applies at moderate scale. 5.0 sd, 5/5 seeds.
+\item \textbf{Friedman1 with 20 pure-noise features} --- signal buried in noise;
+\SXE\ leads on 4/5 seeds, though within spread.
+\end{itemize}
+
+And it loses where bias dominates:
+\begin{itemize}[leftmargin=1.5em,itemsep=1pt]
+\item \textbf{Covertype-full} (465k training rows) is the sharpest case. With
+that much data there is enough signal to fit the bias away, and a sequential
+leaf-wise learner does that better than an averaged forest of randomized trees.
+The gap is small in absolute terms ($0.0031$ AUC) but 57.8 sd --- utterly
+consistent.
+\item \textbf{Superconductivity} (81 correlated informative features) ---
+randomizing the feature subset hurts when most features carry signal, because
+the diversity it buys costs split quality that the data would have supported.
+\item \textbf{California housing} (smooth, low-dimensional, strong signal) sits
+at a plateau that neither leaf-wise growth nor deeper trees moved, which points
+at leaf \emph{values} rather than tree \emph{shape} as the binding constraint
+--- consistent with squared-error training means being the remaining
+approximation.
+\end{itemize}
+
+This is a coherent story rather than a set of scattered outcomes, and it is
+actionable: the levers most likely to close the remaining gaps are all on the
+bias side (Section~\ref{sec:future}).
+
+\subsection{The lasso's real role}
+
+It is tempting to read the weight fit as a corrective stage that improves on
+the boosting trajectory. The diagnostic says otherwise: fitted weights and raw
+uniform generation weights give equal test accuracy, at roughly $10\times$
+compression. The lasso is a \emph{compression} stage. That is exactly what the
+method needs it to be --- the size claim is its entire justification --- but it
+also means the accuracy of \SXE\ is the accuracy of the batch-boosted
+generator, and improvements should be sought there.
+
+\subsection{An observation on fold reuse}
+
+The single validation fold does four jobs: early stopping, the lasso weight
+fit, the cross-validation of $\alpha$ inside that fit, and Platt calibration.
+The $\alpha$ selection is properly nested within the fold, so that is sound.
+But the batches retained by the lasso are selected on the same fold that early
+stopping already optimised against, so the retained set --- and therefore the
+model size, which is the headline claim --- is chosen on data the generator has
+already been steered toward. The test sets are untouched, so
+Section~\ref{sec:results}'s accuracy figures are not affected; the concern is
+specifically that the compression ratio is measured under mild optimism. A
+second fold, or a cross-fitted weight fit, would settle it.
+
+\section{Limitations and threats to validity}\label{sec:limitations}
+
+Stated at the strength the evidence supports.
+
+\paragraph{The defaults are not the method.} Section~\ref{sec:tuninggap} is the
+dominant caveat. Everything in the \SXE\ column of Table~\ref{tab:paired} is a
+tuned \SXE. A user's first fit gives up a median 9.5\% error reduction. Until
+the defaults are fixed, the honest description of the package is ``competitive
+after a search''.
+
+\paragraph{Size is an outcome, not a controlled variable.} Both searches
+optimise accuracy alone. Neither column answers the question the use case
+actually poses --- \emph{what accuracy is available under a size budget} ---
+and answering it would require the search to record every draw's size, which it
+does not.
+
+\paragraph{Size is a formula for LightGBM.} The portable accounting is applied
+identically to both sides, which is the right call for comparison, but it is
+not a byte count of LightGBM's real serialization. LightGBM's format stores
+float thresholds and needs no bin table, which the shared formula charges it
+for anyway. \SXE's own format is now measurably \emph{below} the formula
+(Section~\ref{sec:size}), so the shared rule is conservative for \SXE\ and
+somewhat harsh on LightGBM. A comparison of actual on-disk artefacts would be
+better and has not been done.
+
+\paragraph{Nine datasets, one machine.} Timings are wall-clock on a 10-core
+laptop and will not transfer. Three seeds on the two most expensive datasets is
+thin for a variance estimate.
+
+\paragraph{Seeds are not portable across platforms.} Bit-identical
+reproducibility holds across runs, thread counts and \code{hybrid\_min} on one
+platform, and is tested. It does not hold across C++ standard libraries
+(Section~\ref{sec:determinism}).
+
+\paragraph{Method limits.} Squared error throughout; no logistic loss; no
+second-order leaf values. Multiclass is a one-vs-rest reduction costing one
+ensemble per class --- on Letter, 26 ensembles, 650k leaves and $2.7\times$
+LightGBM's model for slightly worse accuracy. Features are capped at 256 bins.
+There is no general categorical handling beyond binary bundling.
+
+\paragraph{Preprocessing was done for the benchmark.} Categoricals were
+ordinal-coded and missing values imputed before either library saw them.
+Section~\ref{sec:results} prices what that costs in accuracy --- almost nothing
+on this suite --- but not what it costs in user effort, which is real.
+
+\paragraph{Concurrency.} Concurrent \code{fit} calls on a single estimator
+instance are unsupported, as they are for scikit-learn estimators generally.
+
+\section{Related work}\label{sec:related}
+
+\SXE\ is a recombination of established components rather than a new primitive,
+and its lineage is worth stating precisely.
+
+The \textbf{dictionary-then-sparse-combination} structure is Friedman and
+Popescu's Importance Sampled Learning Ensembles \cite{friedman2003isle}:
+generate a large family of trees by some randomized procedure, then fit a
+regularised linear combination of them. RuleFit \cite{friedman2008rulefit} is
+the same idea at the granularity of individual rules (root-to-leaf paths)
+rather than whole trees. \SXE\ sits at a \emph{coarser} granularity than either
+--- one column per batch --- for cost reasons, and Section~\ref{sec:future}
+notes the finer end as unexplored.
+
+The \textbf{non-negativity constraint} on combination weights is Breiman's
+stacked regressions \cite{breiman1996stacked}, motivated there by exactly the
+stability and sparsity properties \SXE\ relies on.
+
+The \textbf{lasso-as-stagewise} justification is the LARS correspondence
+\cite{efron2004lars} and its forward-stagewise analysis
+\cite{hastie2007forward}: the boosting path and the lasso path coincide in the
+infinitesimal-step limit, which is what licenses fitting a convex problem in
+place of the greedy one.
+
+The \textbf{pruning} is classical reduced-error pruning \cite{quinlan1987rep}
+against honest holdout data, with a complexity penalty in the style of
+cost-complexity pruning \cite{breiman1984cart} but evaluated out of sample. The
+use of the out-of-subsample complement is the out-of-bag device
+\cite{breiman1996oob} applied to pruning rather than to error estimation.
+
+The \textbf{per-tree randomization} is in the spirit of extremely randomized
+trees \cite{geurts2006et}, extended from the split threshold to the tree's
+whole hyperparameter vector.
+
+The \textbf{histogram machinery} --- pre-binning, parent-minus-child histogram
+subtraction, exclusive feature bundling, leaf-wise growth --- is LightGBM's
+\cite{ke2017lightgbm}, as is much of the parameter vocabulary via
+scikit-learn's \code{HistGradientBoosting*}.
+
+What is not, to our knowledge, standard is the specific combination: batch
+boosting as a continuous interpolation between forests and boosting;
+\emph{randomizing the pruning strength across members} so the ensemble spans a
+bias--variance spectrum that a later convex fit arbitrates; and applying the
+sparse non-negative fit at batch granularity so that it prunes the boosting
+\emph{trajectory} rather than individual members.
+
+\section{Future work}\label{sec:future}
+
+\subsection{Unbuilt levers already paid for}
+
+Three refinements target leaf \emph{values} rather than tree structure, which
+Section~\ref{sec:discussion} identifies as where the remaining gap most
+plausibly lives. All three are cheap given what the pipeline already computes.
+
+\begin{description}[leftmargin=1.5em,style=nextline]
+\item[Honest leaf values.] The holdout is already routed through every tree and
+its per-node $(n_h, \sum y, \sum y^2)$ are already accumulated for the pruning
+decision --- but exported leaves carry \emph{training} means. Re-estimating
+leaf values from the holdout, as honest trees do in the causal-forest
+literature \cite{wager2018causal}, is nearly free given what is in hand.
+\item[Hierarchical shrinkage.] Shrink each node's prediction toward its parent
+in proportion to sample counts, then delete nodes whose post-shrinkage
+contribution vanishes \cite{agarwal2022hs}. Reported to often beat hard pruning
+on accuracy, and it composes with the existing bottom-up pass rather than
+replacing it.
+\item[Leaf-level re-weighting.] The weight fit operates on batch-average
+columns, coarser than per-tree. The fine end is a ridge or lasso over the
+leaf-membership matrix --- RuleFit territory \cite{friedman2008rulefit} ---
+which can express corrections that per-batch weights cannot.
+\end{description}
+
+\subsection{Then, in expected order of value}
+
+\begin{enumerate}[leftmargin=1.5em,itemsep=1pt]
+\item \textbf{Fix the defaults.} Section~\ref{sec:tuninggap} names the
+direction: deeper trees, more batches, larger batches. Because three knobs hit
+the ceiling of the search space, the first step is a wider search, not a
+re-pick within the current one. This is the highest-value work in the list by a
+distance, because it is the difference between the method and the product.
+\item \textbf{Newton (second-order) leaf values and a learning-rate schedule},
+both aimed at the bias-side gap.
+\item \textbf{Logistic loss and a native multiclass objective}, which would
+retire the one-vs-rest reduction and the $26\times$ cost on Letter.
+\item \textbf{A size-budgeted evaluation}, so the size claim answers the
+question the use case poses.
+\item \textbf{A GPU port}, for which the batch structure is unusually
+well-suited: within a batch, all trees $\times$ all nodes at a depth $\times$
+all candidates reduce to gather and histogram kernels with no sort or argmax
+over raw values, and the weight fit is one small GEMM plus coordinate descent.
+\end{enumerate}
+
+\subsection{Work in flight}\label{sec:inflight}
+
+At the time of writing, the repository's working tree carries two uncommitted
+changes not reflected in the results above.
+
+\emph{Missing-value support.} \code{NaN} is assigned bin 255 and finite values
+occupy $0..254$, as described in Section~\ref{sec:binning}; infinity is still
+rejected, since it is a number the binning cannot place. The estimator's
+\code{allow\_nan} tag flips accordingly and a dedicated test module covers it.
+This removes the preprocessing burden priced in Section~\ref{sec:results}
+without changing the tree code at all.
+
+\emph{A defaults revision.} \code{learning\_rate} $0.15 \to 0.07$,
+\code{max\_iter} $120 \to 300$, \code{batch\_size} $10 \to 16$,
+\code{n\_iter\_no\_change} $8 \to 15$, and \code{max\_depth\_choices}
+$(4,5,6,7,8) \to (6,8,10,12)$ --- a direct response to
+Section~\ref{sec:tuninggap}, moving all three of the identified knobs the way
+the tuned configurations pointed. Whether it closes the gap is a question for
+the full suite; per the project's own rule, a default change is a product
+decision measured across the whole benchmark, not on one dataset.
+
+\section{Reproduction}\label{sec:repro}
+
+\begin{lstlisting}[language=bash]
+pip install -e ".[bench]"
+
+python benchmarks/bench_suite.py                  # full suite, ~1.5 h
+python benchmarks/bench_suite.py -d adult letter  # a subset
+python benchmarks/bench_suite.py --seeds 0        # single seed, quick
+python benchmarks/bench_suite.py --retune         # redo both random searches
+
+python -m pytest tests/                           # 105 tests
+\end{lstlisting}
+
+Raw output lands in \code{benchmarks/results\_suite.csv} and selected
+configurations in \code{benchmarks/tuned\_configs.json}; both are committed as
+the provenance for every table in Section~\ref{sec:results}. Datasets download
+via scikit-learn; Friedman1 is synthetic with a fixed seed. Figures reproduce
+exactly only on the same C++ standard library
+(Section~\ref{sec:determinism}).
+
+The compression and serialized-size measurements in
+Sections~\ref{sec:weights} and~\ref{sec:size} were taken at the reference
+defaults with:
+
+\begin{lstlisting}[language=Python]
+HEAD = dict(learning_rate=0.15, max_iter=120, batch_size=10,
+            n_iter_no_change=8, max_depth_choices=(4, 5, 6, 7, 8))
+m = SXERegressor(random_state=0, **HEAD).fit(X, y)
+nodes, leaves = m.ensemble_.structure(m._members)
+blob     = len(m.ensemble_.serialize())
+portable = (nodes - leaves) * 13 + leaves * 8
+\end{lstlisting}
+
+\section{Conclusion}
+
+\SXE\ is a coherent point in the design space between the random forest and the
+gradient-boosted machine, reached by asking what happens when a boosting step
+is a small forest rather than a single tree. The three devices built on that
+--- randomized members, per-member holdout pruning at randomized strength, and
+a non-negative lasso that deletes most of the trajectory --- are all
+variance-reduction devices, and the empirical results track that fact closely:
+the method wins where variance dominates and loses where bias does, on a
+head-to-head against a tuned LightGBM that splits four--five on accuracy and
+five--four on size.
+
+The engineering claims are stronger than the accuracy claim and are the more
+durable part of the contribution. Reproducibility across thread counts is
+structural rather than best-effort, because per-tree seeds derive from tree
+indices and both growers recurse in the same order; it is tested, not asserted.
+The serialized artefact is now smaller than the portable formula used to
+compare libraries, so the advertised size is conservative. And the parallel
+structure --- independent trees within a batch, one serial update between
+batches --- is a genuine architectural advantage over sequential GBDT that also
+maps unusually cleanly onto a GPU.
+
+The honest headline is the negative one. The shipped defaults give up a median
+9.5\% error reduction to tuning where LightGBM's give up 3.3\%, and the tuned
+configurations agree on the direction of the fix: deeper trees, more batches,
+larger batches. The method is competitive; the product is not yet. Closing that
+specific gap is worth more than any of the accuracy refinements on the list,
+because a user's first fit is what they actually get.
+
+\begin{thebibliography}{99}
+\small
+
+\bibitem{agarwal2022hs}
+A.~Agarwal, Y.~S. Tan, O.~Ronen, C.~Singh, and B.~Yu.
+\newblock Hierarchical shrinkage: Improving the accuracy and interpretability
+of tree-based methods.
+\newblock In \emph{ICML}, 2022.
+
+\bibitem{breiman1996oob}
+L.~Breiman.
+\newblock Out-of-bag estimation.
+\newblock Technical report, Statistics Department, UC Berkeley, 1996.
+
+\bibitem{breiman1996stacked}
+L.~Breiman.
+\newblock Stacked regressions.
+\newblock \emph{Machine Learning}, 24(1):49--64, 1996.
+
+\bibitem{breiman2001rf}
+L.~Breiman.
+\newblock Random forests.
+\newblock \emph{Machine Learning}, 45(1):5--32, 2001.
+
+\bibitem{breiman1984cart}
+L.~Breiman, J.~Friedman, R.~Olshen, and C.~Stone.
+\newblock \emph{Classification and Regression Trees}.
+\newblock Wadsworth, 1984.
+
+\bibitem{chen2016xgboost}
+T.~Chen and C.~Guestrin.
+\newblock XGBoost: A scalable tree boosting system.
+\newblock In \emph{KDD}, 2016.
+
+\bibitem{efron2004lars}
+B.~Efron, T.~Hastie, I.~Johnstone, and R.~Tibshirani.
+\newblock Least angle regression.
+\newblock \emph{Annals of Statistics}, 32(2):407--499, 2004.
+
+\bibitem{friedman2001gbm}
+J.~H. Friedman.
+\newblock Greedy function approximation: A gradient boosting machine.
+\newblock \emph{Annals of Statistics}, 29(5):1189--1232, 2001.
+
+\bibitem{friedman2003isle}
+J.~H. Friedman and B.~E. Popescu.
+\newblock Importance sampled learning ensembles.
+\newblock Technical report, Stanford University, 2003.
+
+\bibitem{friedman2008rulefit}
+J.~H. Friedman and B.~E. Popescu.
+\newblock Predictive learning via rule ensembles.
+\newblock \emph{Annals of Applied Statistics}, 2(3):916--954, 2008.
+
+\bibitem{geurts2006et}
+P.~Geurts, D.~Ernst, and L.~Wehenkel.
+\newblock Extremely randomized trees.
+\newblock \emph{Machine Learning}, 63(1):3--42, 2006.
+
+\bibitem{grinsztajn2022}
+L.~Grinsztajn, E.~Oyallon, and G.~Varoquaux.
+\newblock Why do tree-based models still outperform deep learning on typical
+tabular data?
+\newblock In \emph{NeurIPS Datasets and Benchmarks}, 2022.
+
+\bibitem{hastie2007forward}
+T.~Hastie, J.~Taylor, R.~Tibshirani, and G.~Walther.
+\newblock Forward stagewise regression and the monotone lasso.
+\newblock \emph{Electronic Journal of Statistics}, 1:1--29, 2007.
+
+\bibitem{ke2017lightgbm}
+G.~Ke, Q.~Meng, T.~Finley, T.~Wang, W.~Chen, W.~Ma, Q.~Ye, and T.-Y. Liu.
+\newblock LightGBM: A highly efficient gradient boosting decision tree.
+\newblock In \emph{NeurIPS}, 2017.
+
+\bibitem{platt1999}
+J.~Platt.
+\newblock Probabilistic outputs for support vector machines and comparisons to
+regularized likelihood methods.
+\newblock In \emph{Advances in Large Margin Classifiers}, 1999.
+
+\bibitem{quinlan1987rep}
+J.~R. Quinlan.
+\newblock Simplifying decision trees.
+\newblock \emph{International Journal of Man-Machine Studies}, 27(3):221--234,
+1987.
+
+\bibitem{wager2018causal}
+S.~Wager and S.~Athey.
+\newblock Estimation and inference of heterogeneous treatment effects using
+random forests.
+\newblock \emph{Journal of the American Statistical Association},
+113(523):1228--1242, 2018.
+
+\end{thebibliography}
+
+\appendix
+
+\section{Parameter reference}\label{app:params}
+
+Defaults as at the reference commit. Parameters follow scikit-learn's
+\code{HistGradientBoosting*} vocabulary where the concepts match.
+
+\begin{center}
+\small
+\begin{tabular}{lll}
+\toprule
+Parameter & Default & Meaning \\
+\midrule
+\multicolumn{3}{l}{\emph{Boosting trajectory}} \\
+\code{learning\_rate} & \code{0.15} & $\nu$, shrinkage on each batch-average correction \\
+\code{max\_iter} & \code{120} & maximum boosting batches \\
+\code{batch\_size} & \code{10} & trees grown in parallel per batch \\
+\code{n\_iter\_no\_change} & \code{8} & early-stopping patience, in batches \\
+\code{tol} & \code{1e-4} & improvement threshold, in units of $\Var(y_{\text{val}})$ \\
+\code{validation\_fraction} & \code{0.18} & fold for early stopping, weights and calibration \\
+\addlinespace
+\multicolumn{3}{l}{\emph{Per-tree randomization}} \\
+\code{max\_depth\_choices} & \code{(4,5,6,7,8)} & depth sampled uniformly; \code{0} $\Rightarrow$ 64 \\
+\code{min\_samples\_leaf\_range} & \code{(10, 60)} & log-uniform per tree \\
+\code{max\_features\_range} & \code{(0.5, 1.0)} & candidate-feature fraction, uniform per tree \\
+\code{subsample\_range} & \code{(0.4, 0.75)} & row subsample; the complement is the pruning holdout \\
+\code{prune\_strength\_range} & \code{(1e-3, 1.0)} & $\lambda$, log-uniform per tree \\
+\addlinespace
+\multicolumn{3}{l}{\emph{Tree construction}} \\
+\code{splitter} & \code{"best"} & exact bin scan, or \code{"random"} cut-points \\
+\code{n\_thresholds} & \code{2} & random cut-points per feature when \code{splitter="random"} \\
+\code{max\_leaf\_nodes} & \code{None} & if set, leaf-wise growth with this budget \\
+\code{max\_bins} & \code{256} & quantile bins per feature \\
+\code{bundle\_binary\_features} & \code{False} & exclusive feature bundling for binary columns \\
+\code{hybrid\_min} & \code{600} & node size above which subtraction is used (speed only) \\
+\addlinespace
+\multicolumn{3}{l}{\emph{Weight fit and output}} \\
+\code{l1\_ratio} & \code{1.0} & \code{1.0} is a pure lasso \\
+\code{n\_alphas} & \code{20} & regularisation path length \\
+\code{weight\_cv} & \code{3} & folds for choosing $\alpha$ \\
+\code{calibrate} & \code{"sigmoid"} & Platt scaling of \code{predict\_proba}; \code{None} clips instead \\
+\addlinespace
+\multicolumn{3}{l}{\emph{Execution}} \\
+\code{n\_jobs} & \code{None} & threads; \code{None} $\Rightarrow$ all cores. Does not affect the model \\
+\code{random\_state} & \code{None} & seeds binning, the split, and per-tree randomization \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Tuning guidance}\label{app:tuning}
+
+Distilled from the nine per-dataset searches. Across all of them the same three
+moves recurred --- \textbf{deeper trees, more batches, a larger batch size} ---
+and no winning configuration used the default depth choices.
+
+\begin{description}[leftmargin=1.5em,style=nextline]
+\item[Smooth, low-dimensional signal.] Fine trajectories: small
+\code{learning\_rate}, many batches, small \code{batch\_size}, mild subsampling
+(0.85--1.0), \code{splitter="best"}, \code{max\_leaf\_nodes} $\approx 63$.
+\item[High-dimensional or one-hot data.] \code{max\_depth\_choices=(10,12,14)},
+\code{splitter="random"} with \code{n\_thresholds=3},
+\code{bundle\_binary\_features=True}, moderate subsampling.
+\item[Noisy data with irrelevant features.] Aggressive subsampling (0.2--0.4)
+and a large \code{learning\_rate} with tight \code{n\_iter\_no\_change}. This is
+also where the speed comes from.
+\end{description}
+
+\section{Diagnostics exposed by a fitted model}
+
+\begin{lstlisting}[language=Python]
+model.summary()             # batches, trees grown/kept, leaves, size, timings
+model.feature_importances_  # split-gain, weighted by ensemble weight
+model.n_iter_               # batches actually run before early stopping
+model.n_trees_, model.n_trees_kept_
+model.model_size_bytes_     # the bytes serialize() writes, not an estimate
+\end{lstlisting}
+
+With \code{bundle\_binary\_features=True}, a bundle's gain is divided equally
+among its member columns --- a threshold on a bundle separates a group of them,
+not one --- so those entries are a per-bundle figure spread over its columns
+rather than a per-column measurement.
+
+\end{document}

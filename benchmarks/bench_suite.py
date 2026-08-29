@@ -66,19 +66,27 @@ from sxe import SXEClassifier, SXERegressor
 warnings.filterwarnings("ignore")
 HERE = pathlib.Path(__file__).parent
 
-# Compact-model accounting, applied identically to both libraries. An internal
-# node is (feature int32, threshold uint8, left int32, right int32) and a leaf
-# is one double. A binned encoding needs the bin table to map raw features to
-# bin ids at predict time, so it is counted too -- for both sides, over the
-# feature count each model actually operates on.
+# Two size columns, because they answer different questions.
 #
-# This flatters neither library. LightGBM's real format stores float64
-# thresholds and therefore needs no bin table; charging it one here is the
-# assumption that makes the tree structures directly comparable.
+# `portable_bytes` is one formula applied identically to both libraries: 13
+# bytes per internal node (feature int32, threshold uint8, two child int32), 8
+# per leaf, plus a full 255-edge float64 bin table per input feature. It
+# compares *tree structure* on equal terms and nothing else. It is a poor guide
+# to actual size: it charges LightGBM for a bin table its format does not need,
+# and it charges both for edges that deduplicate away on low-cardinality data
+# or are never indexed at all on wide data.
+#
+# `real_bytes` is what each library would actually have to ship. For SXE it is
+# measured -- `model_size_bytes_`, the bytes serialize() writes plus the
+# quantile edges of the columns the trees index. For LightGBM it is the
+# smallest sensible encoding of what its trees need: a float64 threshold rather
+# than a bin id, an explicit left child, and no bin table. That is generous to
+# LightGBM, whose real files also carry split gains and node counts.
 BYTES_PER_INTERNAL = 13
 BYTES_PER_LEAF = 8
 BYTES_PER_BIN_EDGE = 8
 BINS_PER_FEATURE = 255
+LGBM_BYTES_PER_INTERNAL = 20  # feature int32 + threshold float64 + 2 x child int32
 
 
 def _use_certifi():
@@ -347,15 +355,18 @@ def impute(Xtr, Xte):
 # ---------------------------------------------------------------------------
 # scoring
 # ---------------------------------------------------------------------------
-def model_bytes(n_leaves, n_trees, n_features):
-    """Compact serialized size under one formula, for either library.
-
-    Trees are full binary, so internal nodes = leaves - trees.
-    """
+def portable_bytes(n_leaves, n_trees, n_features):
+    """The equal-terms structural formula. Trees are full binary, so
+    internal nodes = leaves - trees."""
     n_internal = max(0, n_leaves - n_trees)
     struct = n_internal * BYTES_PER_INTERNAL + n_leaves * BYTES_PER_LEAF
     bins = n_features * BINS_PER_FEATURE * BYTES_PER_BIN_EDGE
     return struct, bins, struct + bins
+
+
+def lightgbm_real_bytes(n_leaves, n_trees):
+    """What LightGBM's trees would cost in the smallest sensible encoding."""
+    return max(0, n_leaves - n_trees) * LGBM_BYTES_PER_INTERNAL + n_leaves * BYTES_PER_LEAF
 
 
 def score(task, model, X, y):
@@ -379,9 +390,9 @@ def score(task, model, X, y):
     )
 
 
-def result(model_name, task, model, X, y, fit_s, n_trees, n_leaves, n_features):
+def result(model_name, task, model, X, y, fit_s, n_trees, n_leaves, n_features, real_bytes):
     m1, v1, m2, v2 = score(task, model, X, y)
-    struct, bins, compact = model_bytes(n_leaves, n_trees, n_features)
+    struct, bins, portable = portable_bytes(n_leaves, n_trees, n_features)
     return dict(
         model=model_name,
         metric=m1,
@@ -394,7 +405,8 @@ def result(model_name, task, model, X, y, fit_s, n_trees, n_leaves, n_features):
         n_features_model=n_features,
         struct_bytes=struct,
         bins_bytes=bins,
-        compact_bytes=compact,
+        portable_bytes=portable,
+        real_bytes=real_bytes,
     )
 
 
@@ -521,7 +533,15 @@ def selection_loss(task, model, X, y):
     return -accuracy_score(y, model.predict(X))
 
 
-def tune(library, task, Xtr, ytr, seed, budget, cap, n_binary, warm=()):
+def fitted_size(library, model, n_features):
+    """Bytes the fitted model would ship, in each library's own format."""
+    if library == "SXE":
+        return int(model.model_size_bytes_)
+    info = model.booster_.dump_model()["tree_info"]
+    return lightgbm_real_bytes(sum(t["num_leaves"] for t in info), len(info))
+
+
+def tune(library, task, Xtr, ytr, seed, budget, cap, n_binary, warm=(), record=None):
     """Random search on a held-out fold, identical protocol for both libraries.
 
     LightGBM early-stops on the same fold it is selected on, which is mildly
@@ -529,6 +549,10 @@ def tune(library, task, Xtr, ytr, seed, budget, cap, n_binary, warm=()):
     and so is selected on data it has not seen at all. Correcting that would
     mean a third fold and less training data for LightGBM, which would be a
     different kind of unfair.
+
+    Every draw's (loss, size) goes into ``record``. Selection optimises
+    accuracy alone, so the winner says nothing about what either library can do
+    under a size budget -- the draws do, and they cost nothing extra to keep.
     """
     strat = ytr if task != "regression" else None
     Xa, Xb, ya, yb = train_test_split(Xtr, ytr, test_size=0.15, random_state=seed, stratify=strat)
@@ -540,13 +564,17 @@ def tune(library, task, Xtr, ytr, seed, budget, cap, n_binary, warm=()):
         try:
             model, fit_s = fitter(task, params, Xa, ya, Xb, yb, seed, -1)
             loss = selection_loss(task, model, Xb, yb)
+            size = fitted_size(library, model, Xa.shape[1])
         except Exception as exc:  # a pathological draw, e.g. num_leaves > rows
             print(f"    {library} [{i + 1}/{len(draws)}] skipped: {type(exc).__name__}", flush=True)
             continue
+        if record is not None:
+            record.append(dict(library=library, draw=i, loss=loss, real_bytes=size, fit_s=fit_s))
         if loss < best_loss:
             best, best_loss = params, loss
             print(
-                f"    {library} [{i + 1}/{len(draws)}] best {loss:+.5f} ({fit_s:.1f}s) {params}",
+                f"    {library} [{i + 1}/{len(draws)}] best {loss:+.5f} "
+                f"({fit_s:.1f}s, {size / 1e6:.2f} MB) {params}",
                 flush=True,
             )
     return best, float(best_loss)
@@ -558,13 +586,35 @@ def run_model(library, task, Xtr, ytr, Xte, yte, params, n_jobs, seed, cat_idx=N
     if library == "SXE":
         m, fit_s = _sxe_fit(task, params, Xtr, ytr, None, None, seed, n_jobs)
         n_feat = m.bundler_.n_features_out_ if m.bundler_ is not None else Xtr.shape[1]
-        return result(tag, task, m, Xte, yte, fit_s, m.n_trees_kept_, m.n_leaves_, n_feat)
+        return result(
+            tag,
+            task,
+            m,
+            Xte,
+            yte,
+            fit_s,
+            m.n_trees_kept_,
+            m.n_leaves_,
+            n_feat,
+            m.model_size_bytes_,
+        )
     strat = ytr if task != "regression" else None
     Xa, Xb, ya, yb = train_test_split(Xtr, ytr, test_size=0.15, random_state=seed, stratify=strat)
     g, fit_s = _lgbm_fit(task, params, Xa, ya, Xb, yb, seed, n_jobs, cat_idx=cat_idx)
     info = g.booster_.dump_model()["tree_info"]
     n_leaves = sum(t["num_leaves"] for t in info)
-    return result(tag, task, g, Xte, yte, fit_s, len(info), n_leaves, Xtr.shape[1])
+    return result(
+        tag,
+        task,
+        g,
+        Xte,
+        yte,
+        fit_s,
+        len(info),
+        n_leaves,
+        Xtr.shape[1],
+        lightgbm_real_bytes(n_leaves, len(info)),
+    )
 
 
 def load_tuned(path):
@@ -587,8 +637,8 @@ def summarise(rows, names):
         seeds = len({r["seed"] for r in sub})
         print(f"\n=== {name} ({m1} / {m2}, {seeds} seeds) ===")
         head = (
-            f"  {'model':<18}{m1:<20}{m2:<18}{'leaves':<11}{'size MB':<10}"
-            f"{'best fit s':<14}{'@threads'}"
+            f"  {'model':<18}{m1:<20}{m2:<18}{'leaves':<11}{'real MB':<10}"
+            f"{'portable':<11}{'best fit s':<14}{'@threads'}"
         )
         print(head)
         print("  " + "-" * (len(head) - 2))
@@ -600,7 +650,8 @@ def summarise(rows, names):
             v1m, v1s = cell([r["value"] for r in base])
             v2m, _ = cell([r["value2"] for r in base])
             lm, _ = cell([r["n_leaves"] for r in base])
-            sm, _ = cell([r["compact_bytes"] for r in base])
+            sm, _ = cell([r["real_bytes"] for r in base])
+            pm, _ = cell([r["portable_bytes"] for r in base])
             by_thread = {}
             for r in ms:
                 by_thread.setdefault(r["n_jobs"], []).append(r["fit_s"])
@@ -608,8 +659,33 @@ def summarise(rows, names):
             tm, ts = cell(by_thread[best_nj])
             print(
                 f"  {model:<18}{v1m:.4f} +- {v1s:.4f}   {v2m:>9.4f}         "
-                f"{lm:>9,.0f}  {sm / 1e6:>8.3f}  {tm:>6.2f} +- {ts:<5.2f}  {best_nj:>5}"
+                f"{lm:>9,.0f}  {sm / 1e6:>8.3f}  {pm / 1e6:>9.3f}  "
+                f"{tm:>6.2f} +- {ts:<5.2f}  {best_nj:>5}"
             )
+
+
+def size_budgets(draws, names):
+    """Best selection loss each library reached under a size ceiling.
+
+    This is the question the size claim is actually about -- what accuracy is
+    available if the model has to fit in N megabytes -- and it is the one a
+    single accuracy-tuned point per library cannot answer.
+    """
+    for name in names:
+        sub = [d for d in draws if d["dataset"] == name]
+        if not sub:
+            continue
+        libs = sorted({d["library"] for d in sub})
+        ceilings = [0.1e6, 0.5e6, 2e6, 10e6, float("inf")]
+        print(f"\n=== {name}: best selection loss under a size ceiling ===")
+        print("  ceiling   " + "".join(f"{lib:>14}" for lib in libs))
+        for c in ceilings:
+            label = "any" if c == float("inf") else f"{c / 1e6:g} MB"
+            cells = []
+            for lib in libs:
+                ok = [d["loss"] for d in sub if d["library"] == lib and d["real_bytes"] <= c]
+                cells.append(f"{min(ok):>14.5f}" if ok else f"{'-':>14}")
+            print(f"  {label:<10}" + "".join(cells))
 
 
 def write_csv(rows, out):
@@ -644,7 +720,7 @@ def main():
 
     tuned_path = pathlib.Path(args.tuned_file)
     tuned = load_tuned(tuned_path)
-    rows = []
+    rows, draws = [], []
 
     for name in args.datasets:
         spec = DATASETS[name]
@@ -678,7 +754,11 @@ def main():
                     warm = [{}]
                     if library == "SXE" and name in TUNED_SXE:
                         warm.append(TUNED_SXE[name])
-                    params, loss = tune(library, task, Xtr, ytr, 0, budget, cap, n_binary, warm)
+                    params, loss = tune(
+                        library, task, Xtr, ytr, 0, budget, cap, n_binary, warm, draws
+                    )
+                    for d in draws[len(draws) - budget - len(warm) :]:
+                        d.setdefault("dataset", name)
                     tuned[key] = {"params": params, "search_loss": loss}
                     tuned_path.write_text(json.dumps(tuned, indent=2, sort_keys=True, default=list))
 
@@ -731,12 +811,15 @@ def main():
                     print(
                         f"  {r['model']:<18} {r['metric']} {r['value']:.4f}  "
                         f"{r['metric2']} {r['value2']:.4f}  {r['fit_s']:7.2f}s  "
-                        f"{r['compact_bytes'] / 1e6:8.3f} MB  {r['n_leaves']:>8,} leaves",
+                        f"{r['real_bytes'] / 1e6:8.3f} MB  {r['n_leaves']:>8,} leaves",
                         flush=True,
                     )
                 rows += runs
 
     summarise(rows, args.datasets)
+    if draws:
+        size_budgets(draws, args.datasets)
+        write_csv(draws, str(HERE / "tuning_draws.csv"))
     write_csv(rows, args.out)
 
 
