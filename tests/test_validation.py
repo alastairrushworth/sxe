@@ -30,20 +30,15 @@ def test_predict_before_fit_raises(reg_data):
         SXERegressor().predict(X)
 
 
-@pytest.mark.parametrize("bad", [np.nan, np.inf, -np.inf])
-def test_non_finite_input_raises(reg_data, bad):
+@pytest.mark.parametrize("bad", [np.inf, -np.inf])
+def test_infinity_still_raises(reg_data, bad):
+    """NaN means missing; infinity is a number the binning cannot place."""
     X, y = reg_data
     Xb = X.copy()
     Xb[0, 0] = bad
     with pytest.raises(ValueError, match="[Ii]nfinity|NaN|nan"):
         SXERegressor(random_state=0, **CFG).fit(Xb, y)
-
-
-def test_non_finite_at_predict_raises(reg_data):
-    X, y = reg_data
     model = SXERegressor(random_state=0, **CFG).fit(X, y)
-    Xb = X.copy()
-    Xb[0, 0] = np.nan
     with pytest.raises(ValueError, match="[Ii]nfinity|NaN|nan"):
         model.predict(Xb)
 

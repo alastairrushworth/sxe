@@ -5,6 +5,12 @@ prediction, the weight-fit design matrix -- operates on the single uint8
 matrix produced here. A uniform random threshold drawn by an extremely
 randomized split on binned data is exactly a random bin cut-point, so
 binning and ExtraTrees-style splitting compose without approximation.
+
+Missing values get the top bin. Finite values occupy 0..254 and NaN occupies
+255, which needs no support at all in the tree code: a split routes bin 255
+like any other, so missing always travels with the largest values *unless* a
+split at 254 separates it, and the exact-cut scan will find that split when it
+pays. Nothing is imputed and nothing is guessed.
 """
 
 from __future__ import annotations
@@ -14,6 +20,7 @@ import numpy as np
 __all__ = ["QuantileBinner"]
 
 MAX_BINS = 256
+MISSING_BIN = 255
 
 
 class QuantileBinner:
@@ -48,10 +55,19 @@ class QuantileBinner:
         n = X.shape[0]
         if n > self.subsample:
             X = X[rng.choice(n, self.subsample, replace=False)]
-        qs = np.linspace(0.0, 1.0, self.n_bins + 1)[1:-1]
-        self.edges_ = [np.unique(np.quantile(X[:, j], qs)) for j in range(X.shape[1])]
+        # One fewer interior point than there are bins, so the largest finite
+        # bin is 254 and MISSING_BIN stays free.
+        qs = np.linspace(0.0, 1.0, self.n_bins)[1:-1]
+        self.edges_ = [self._column_edges(X[:, j], qs) for j in range(X.shape[1])]
         self.n_features_in_ = X.shape[1]
         return self
+
+    @staticmethod
+    def _column_edges(col, qs):
+        col = col[np.isfinite(col)]
+        if col.size == 0:  # an all-missing column: every row lands in MISSING_BIN
+            return np.empty(0, dtype=np.float64)
+        return np.unique(np.quantile(col, qs))
 
     def transform(self, X) -> np.ndarray:
         if not hasattr(self, "edges_"):
@@ -66,8 +82,16 @@ class QuantileBinner:
             )
         out = np.empty(X.shape, dtype=np.uint8)
         for j, e in enumerate(self.edges_):
-            # searchsorted yields bin ids in [0, len(e)]; len(e) <= n_bins - 1 <= 255
-            out[:, j] = np.searchsorted(e, X[:, j], side="right")
+            col = X[:, j]
+            # searchsorted yields bin ids in [0, len(e)] and len(e) <= 254, so
+            # MISSING_BIN cannot collide with a finite bin. NaN sorts above
+            # every edge, which would silently put it in the top finite bin --
+            # hence the explicit overwrite rather than relying on the sort.
+            b = np.searchsorted(e, col, side="right").astype(np.uint8)
+            missing = np.isnan(col)
+            if missing.any():
+                b[missing] = MISSING_BIN
+            out[:, j] = b
         return out
 
     def restrict(self, used) -> QuantileBinner:

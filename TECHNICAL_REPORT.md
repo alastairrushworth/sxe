@@ -158,12 +158,12 @@ The package names are on the left; the names used in the rest of this report and
 
 | Parameter | Default | Prototype name | Meaning |
 |---|---|---|---|
-| `batch_size`, `max_iter` | 10, 120 | `batch`, `max_batches` | trees per parallel batch; batch budget. |
-| `learning_rate` | 0.15 | `shrink` | ν, the shrinkage per batch-average correction. |
-| `n_iter_no_change`, `tol` | 8, 1e-4 | `patience` | early-stop patience in batches (tol is in units of Var(y_val)). |
+| `batch_size`, `max_iter` | 16, 300 | `batch`, `max_batches` | trees per parallel batch; batch budget. |
+| `learning_rate` | 0.07 | `shrink` | ν, the shrinkage per batch-average correction. |
+| `n_iter_no_change`, `tol` | 15, 1e-4 | `patience` | early-stop patience in batches (tol is in units of Var(y_val)). |
 | `splitter`, `n_thresholds` | `"best"`, 2 | `argmax_bins`, `n_thresh` | exact best cut per sampled feature, or `n_thresholds` random cuts. |
 | `max_leaf_nodes` | None | `max_leaves` | if set, leaf-wise growth with this budget (use `max_depth_choices=(0,)`). |
-| `max_depth_choices` | (4,5,6,7,8) | `depth_choices` | per-tree depth sampled uniformly; 0 ⇒ 64. |
+| `max_depth_choices` | (6,8,10,12) | `depth_choices` | per-tree depth sampled uniformly; 0 ⇒ 64. |
 | `min_samples_leaf_range` | (10, 60) | `leaf_range` | `min_samples_leaf`, log-uniform per tree. |
 | `max_features_range` | (0.5, 1.0) | `feat_range` | candidate-feature fraction, uniform per tree. |
 | `subsample_range` | (0.4, 0.75) | — | row-subsample rate per tree; complement is the pruning holdout. |
@@ -171,7 +171,7 @@ The package names are on the left; the names used in the rest of this report and
 | `validation_fraction` | 0.18 | `val_fraction` | validation fold for early stopping and the weight fit. |
 | `bundle_binary_features` | False | `bundle_binary` | enable EFB for binary columns. |
 | `hybrid_min` | 600 | — | node size above which the subtraction scheme is used. |
-| `max_bins` | 256 | `n_bins` | quantile bins per feature. |
+| `max_bins` | 256 | `n_bins` | quantile bins per feature; the top bin is reserved for missing values. |
 | `l1_ratio`, `n_alphas`, `weight_cv` | 1.0, 20, 3 | `l1_ratios`, `n_alphas`, `cv` | weight-fit grid (positive lasso, Gram-precomputed CV). |
 | `n_jobs` | None | — | threads for growth and prediction; None ⇒ all cores. Results do not depend on it. |
 | `random_state` | None | — | seeds binning, the split, and per-tree randomisation. |

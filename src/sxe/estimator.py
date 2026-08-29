@@ -30,6 +30,7 @@ _NO_VALIDATION = "no_validation"
 
 
 def _validate(est, X, y=_NO_VALIDATION, *, reset=True, **kw):
+    kw.setdefault(_FINITE_KW, "allow-nan")
     if _sk_validate_data is not None:
         return _sk_validate_data(est, X, y, reset=reset, **kw)
     return est._validate_data(X, y, reset=reset, **kw)  # pragma: no cover
@@ -47,6 +48,12 @@ def _sklearn_at_least(major, minor):
 # int) and deprecated it; 1.9 removed it outright. Same regularisation path
 # either way -- only the keyword moved.
 _ENET_USES_ALPHAS_INT = _sklearn_at_least(1, 7)
+
+# scikit-learn 1.6 renamed ``force_all_finite`` to ``ensure_all_finite``. Both
+# spellings mean the same thing; "allow-nan" admits NaN and still rejects
+# infinity, which is what SXE wants -- NaN is missing, infinity is a number
+# the binning cannot place.
+_FINITE_KW = "ensure_all_finite" if _sklearn_at_least(1, 6) else "force_all_finite"
 
 
 def _enet_path_size(n_alphas):
@@ -117,14 +124,14 @@ class _BaseSXE(BaseEstimator):
 
     Parameters
     ----------
-    learning_rate : float, default=0.15
+    learning_rate : float, default=0.07
         Shrinkage applied to each batch-average correction (nu).
-    max_iter : int, default=120
+    max_iter : int, default=300
         Maximum number of boosting batches.
-    batch_size : int, default=10
+    batch_size : int, default=16
         Trees grown in parallel per batch. batch_size=1 recovers ordinary
         stochastic gradient boosting; a single large batch recovers a forest.
-    n_iter_no_change : int, default=8
+    n_iter_no_change : int, default=15
         Batches without validation improvement before early stopping.
     tol : float, default=1e-4
         Early-stopping tolerance, in units of the validation target variance.
@@ -132,8 +139,9 @@ class _BaseSXE(BaseEstimator):
         Fraction of the training data held out for early stopping and the
         weight fit. Note this fold is used for both.
     max_bins : int, default=256
-        Quantile bins per feature; at most 256.
-    max_depth_choices : tuple of int, default=(4, 5, 6, 7, 8)
+        Quantile bins per feature; at most 256. The top bin is reserved for
+        missing values, so finite values occupy at most 255 of them.
+    max_depth_choices : tuple of int, default=(6, 8, 10, 12)
         Per-tree max depth, sampled uniformly. 0 means unlimited (capped 64).
     max_leaf_nodes : int or None, default=None
         If set, grow leaf-wise with this leaf budget instead of depth-wise.
@@ -194,14 +202,14 @@ class _BaseSXE(BaseEstimator):
     def __init__(
         self,
         *,
-        learning_rate=0.15,
-        max_iter=120,
-        batch_size=10,
-        n_iter_no_change=8,
+        learning_rate=0.07,
+        max_iter=300,
+        batch_size=16,
+        n_iter_no_change=15,
         tol=1e-4,
         validation_fraction=0.18,
         max_bins=256,
-        max_depth_choices=(4, 5, 6, 7, 8),
+        max_depth_choices=(6, 8, 10, 12),
         max_leaf_nodes=None,
         min_samples_leaf_range=(10, 60),
         max_features_range=(0.5, 1.0),
@@ -536,12 +544,12 @@ class _BaseSXE(BaseEstimator):
     # -- tags ----------------------------------------------------------------
     def __sklearn_tags__(self):  # scikit-learn >= 1.6
         tags = super().__sklearn_tags__()
-        tags.input_tags.allow_nan = False
+        tags.input_tags.allow_nan = True
         tags.input_tags.sparse = False
         return tags
 
     def _more_tags(self):  # pragma: no cover - scikit-learn < 1.6
-        return {"allow_nan": False, "requires_y": True}
+        return {"allow_nan": True, "requires_y": True}
 
 
 class SXERegressor(RegressorMixin, _BaseSXE):

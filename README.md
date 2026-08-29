@@ -108,10 +108,10 @@ translation. The genuinely SXE-specific ones are:
 
 | Parameter | Default | Meaning |
 |---|---|---|
-| `batch_size` | `10` | Trees grown in parallel per boosting step. `1` recovers ordinary stochastic gradient boosting; one huge batch recovers a random forest. |
+| `batch_size` | `16` | Trees grown in parallel per boosting step. `1` recovers ordinary stochastic gradient boosting; one huge batch recovers a random forest. |
 | `subsample_range` | `(0.4, 0.75)` | Per-tree row subsample rate. The complement is that tree's pruning holdout, so rates near `1.0` leave little to prune against. |
 | `prune_strength_range` | `(1e-3, 1.0)` | Per-tree holdout pruning penalty λ, sampled log-uniformly. Small λ removes only splits that do not help held-out data. |
-| `max_depth_choices` | `(4, 5, 6, 7, 8)` | Per-tree depth, sampled uniformly. `0` means unlimited. |
+| `max_depth_choices` | `(6, 8, 10, 12)` | Per-tree depth, sampled uniformly. `0` means unlimited. |
 | `min_samples_leaf_range` | `(10, 60)` | Sampled log-uniformly per tree. |
 | `max_features_range` | `(0.5, 1.0)` | Candidate-feature fraction, sampled uniformly per tree. |
 | `splitter` | `"best"` | `"best"` scans all bins for the optimal cut; `"random"` draws `n_thresholds` random cut-points, trading split quality for member diversity. |
