@@ -225,8 +225,8 @@ DATASETS = {
         loader=load_covtype_full,
         seeds=3,
         budget=10,
-        cap=120,
-        threads=(1, -1),
+        cap=200,
+        threads=(-1,),
         note="large n: 581k rows, where gradient-boosting scaling shows",
     ),
     "adult": dict(
