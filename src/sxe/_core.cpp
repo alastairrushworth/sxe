@@ -202,6 +202,7 @@ struct GrownTree {
     std::vector<double>  gain;
     std::vector<double>  h_cnt, h_sum, h_ssq;       // holdout stats per node:
                                                     // cnt, K sums, one total ssq
+    std::vector<double>  h_hess;                    // holdout hessian sums (K each), if wanted
     std::vector<int64_t> lo, hi;                    // node's row range in ws.idx
     std::vector<uint8_t> lin_cnt;                   // linear leaves, as in Tree
     std::vector<int32_t> lin_start, lin_feat;
@@ -235,6 +236,8 @@ struct Workspace {
     std::vector<int32_t> hqsum;      // small-node histogram: quantized sums
     std::vector<int16_t> q;          // quantized residual, n*K, when quant
     bool                 quant = false;
+    const double*        fw = nullptr;   // candidate-feature weights (nullptr = uniform)
+    std::vector<double>  keys;           // scratch for weighted subset draws
     int                  nout = 1;   // target columns K (1 = scalar target)
     int                  hybrid_min = 600;  // node size above which the
                                             // subtraction scheme is used
@@ -262,6 +265,22 @@ struct TreeParams {
 // ---------------------------------------------------------------------------
 // growth
 // ---------------------------------------------------------------------------
+// Weighted candidate draw: K distinct features with inclusion probability
+// rising in ws.fw (Efraimidis & Spirakis 2006: key = U^(1/w), keep the K
+// largest). Fills ws.featbuf[0..K). Only used when weights are set; the
+// uniform path keeps its in-loop partial Fisher-Yates so it stays bit-identical.
+inline void draw_weighted_candidates(Workspace& ws, int p, int K) {
+    ws.keys.resize(p);
+    std::uniform_real_distribution<double> U(0.0, 1.0);
+    for (int j = 0; j < p; ++j) {
+        const double u = std::max(1e-300, U(ws.rng));
+        ws.keys[j] = std::log(u) / std::max(1e-12, ws.fw[j]);   // larger is better
+        ws.featbuf[j] = j;
+    }
+    std::partial_sort(ws.featbuf.begin(), ws.featbuf.begin() + K, ws.featbuf.end(),
+                      [&](int a, int b) { return ws.keys[a] > ws.keys[b] || (ws.keys[a] == ws.keys[b] && a < b); });
+}
+
 // Variance-reduction gain of a cut with (cl, sl[k]) on the left, summed over
 // the K targets. With K == 1 this is the scalar expression, operation for
 // operation.
@@ -356,9 +375,11 @@ int32_t grow_node_legacy(GrownTree& T, const uint8_t* X, const double* y,
     if (depth >= tp.max_depth || m < 2 * (int64_t)tp.min_leaf || node_pure(Kt, ssq, sumk, meank))
         return id;
 
-    // sample K distinct candidate features (partial Fisher-Yates)
+    // sample K distinct candidate features (partial Fisher-Yates, or a
+    // weighted draw when feature weights are set)
     for (int j = 0; j < p; ++j) ws.featbuf[j] = j;
     const int K = std::min(tp.K, p);
+    if (ws.fw) draw_weighted_candidates(ws, p, K);
 
     int best_f = -1, best_t = -1;
     double best_gain = -1.0;
@@ -369,8 +390,10 @@ int32_t grow_node_legacy(GrownTree& T, const uint8_t* X, const double* y,
     }
 
     for (int c = 0; c < K; ++c) {
-        std::uniform_int_distribution<int> pick(c, p - 1);
-        std::swap(ws.featbuf[c], ws.featbuf[pick(ws.rng)]);
+        if (!ws.fw) {
+            std::uniform_int_distribution<int> pick(c, p - 1);
+            std::swap(ws.featbuf[c], ws.featbuf[pick(ws.rng)]);
+        }
         const int f = ws.featbuf[c];
         const uint8_t* col = X + (int64_t)f * n;
 
@@ -580,9 +603,12 @@ SplitEval best_split_scan(const int32_t* cnt, const S* sums, int p, int64_t m,
     double* sl = ws.sl.data();
     for (int j = 0; j < p; ++j) ws.featbuf[j] = j;
     const int K = std::min(tp.K, p);
+    if (ws.fw) draw_weighted_candidates(ws, p, K);
     for (int c = 0; c < K; ++c) {
-        std::uniform_int_distribution<int> pick(c, p - 1);
-        std::swap(ws.featbuf[c], ws.featbuf[pick(ws.rng)]);
+        if (!ws.fw) {
+            std::uniform_int_distribution<int> pick(c, p - 1);
+            std::swap(ws.featbuf[c], ws.featbuf[pick(ws.rng)]);
+        }
         const int f = ws.featbuf[c];
         const int32_t* hc = cnt + (size_t)f * 256;
         const S*       hs = sums + (size_t)f * 256 * Kt;
@@ -804,10 +830,11 @@ void grow_tree_leafwise(GrownTree& T, const uint8_t* X, const double* y,
 // and remembering the leaf each row reached so it is never walked again
 void route_holdout(GrownTree& T, const uint8_t* X, const double* y, int K,
                    int64_t n, const std::vector<int64_t>& hold,
-                   std::vector<int32_t>& leaf_of)
+                   std::vector<int32_t>& leaf_of, const double* hess = nullptr)
 {
     const size_t nn = T.feat.size();
     T.h_cnt.assign(nn, 0.0); T.h_sum.assign(nn * (size_t)K, 0.0); T.h_ssq.assign(nn, 0.0);
+    T.h_hess.assign(hess ? nn * (size_t)K : 0, 0.0);
     leaf_of.resize(hold.size());
     for (size_t j = 0; j < hold.size(); ++j) {
         const int64_t r = hold[j];
@@ -818,6 +845,7 @@ void route_holdout(GrownTree& T, const uint8_t* X, const double* y, int K,
             for (int k = 0; k < K; ++k) {
                 const double v = yr[k];
                 T.h_sum[(size_t)id * K + k] += v; T.h_ssq[id] += v * v;
+                if (hess) T.h_hess[(size_t)id * K + k] += hess[r * K + k];
             }
             const int32_t f = T.feat[id];
             if (f < 0) break;
@@ -863,7 +891,7 @@ void exported_leaf_of(const GrownTree& T, const std::vector<uint8_t>* collapsed,
 // and pruning were decided on the means; only the exported values change.
 void newton_refit(GrownTree& T, int K, const std::vector<int32_t>& rep,
                   const std::vector<int64_t>& idx, const double* g, const double* h,
-                  double l2)
+                  double l2, bool all_rows = false)
 {
     const int32_t nn = (int32_t)T.feat.size();
     std::vector<double> sg((size_t)nn * K, 0.0), sh((size_t)nn * K, 0.0);
@@ -875,6 +903,17 @@ void newton_refit(GrownTree& T, int K, const std::vector<int32_t>& rep,
             for (int k = 0; k < K; ++k) {
                 sg[(size_t)r * K + k] += g[row * K + k];
                 sh[(size_t)r * K + k] += h[row * K + k];
+            }
+        }
+    }
+    // the holdout quarter's rows too: structure and pruning were decided
+    // without them, the values may use them (a free variance reduction)
+    if (all_rows && !T.h_hess.empty()) {
+        for (int32_t id = 0; id < nn; ++id) {
+            if (rep[id] != id) continue;
+            for (int k = 0; k < K; ++k) {
+                sg[(size_t)id * K + k] += T.h_sum[(size_t)id * K + k];
+                sh[(size_t)id * K + k] += T.h_hess[(size_t)id * K + k];
             }
         }
     }
@@ -1012,6 +1051,21 @@ inline double node_value(const TreeT& T, int32_t id, const uint8_t* X, int64_t n
             v += T.lin_coef[(size_t)s0 + j] * (double)X[(int64_t)T.lin_feat[(size_t)s0 + j] * n + r];
     }
     return v;
+}
+
+// Squared-error leaf refit on all rows: the exported leaf's value becomes the
+// mean over its training rows *and* the holdout rows that reached it.
+void mean_refit_all_rows(GrownTree& T, int K, const std::vector<int32_t>& rep)
+{
+    const int32_t nn = (int32_t)T.feat.size();
+    for (int32_t id = 0; id < nn; ++id) {
+        if (rep[id] != id) continue;
+        const double m = (double)(T.hi[id] - T.lo[id]);
+        const double tot = m + T.h_cnt[id];
+        if (tot <= 0.0) continue;
+        for (int k = 0; k < K; ++k)
+            T.val[(size_t)id * K + k] = (T.val[(size_t)id * K + k] * m + T.h_sum[(size_t)id * K + k]) / tot;
+    }
 }
 
 // Training-fold prediction without a tree walk: every subsample row sits in
@@ -1315,8 +1369,10 @@ public:
                     double lam_lo, double lam_hi,
                     double leaf_shrink, int hist_bits, double leaf_l2, int loss,
                     int linear_feats, double linear_lambda,
+                    double feature_power, int leaf_refit_all, int honest_residuals,
                     int hybrid_min, uint64_t seed, int n_jobs)
     {
+        if (feature_power < 0.0) throw std::invalid_argument("feature_weighting must be >= 0");
         if (linear_feats < 0 || linear_feats > 255) throw std::invalid_argument("linear_leaves must be in [0, 255]");
         if (linear_lambda <= 0.0 && linear_feats > 0) throw std::invalid_argument("linear_lambda must be > 0");
         if (leaf_l2 < 0.0) throw std::invalid_argument("leaf_l2 must be >= 0");
@@ -1404,6 +1460,13 @@ public:
         std::vector<int32_t> fold_of((size_t)(nF > 0 ? n : 0));
         std::vector<int32_t> oob_cnt((size_t)n_oob);
 
+        // Gain-informed candidate sampling: an exponential moving average of
+        // each feature's share of split gain, updated after every batch from
+        // the batch's trees in a fixed order, sets the next batch's sampling
+        // weights (1/p + share)^power. Zero power keeps the uniform draw.
+        std::vector<double> fgain((size_t)p, 0.0), fweights((size_t)p, 1.0);
+        const bool weighted = feature_power > 0.0;
+
         double best = 1e300;
         int bad = 0, n_batches = 0;
         // Quantized training: each batch the residual is scaled so its largest
@@ -1446,6 +1509,7 @@ public:
                     Workspace ws;
                     ws.rng.seed(splitmix64(seed + 0x9E3779B9ULL * (uint64_t)(b * batch + t + 1)));
                     ws.featbuf.resize(p);
+                    ws.fw = (weighted && b > 0) ? fweights.data() : nullptr;
                     ws.nout = K;
                     ws.hcnt.assign(256, 0); ws.hsum.assign((size_t)256 * K, 0.0);
                     ws.sumk.assign(K, 0.0); ws.meank.assign(K, 0.0); ws.sl.assign(K, 0.0);
@@ -1527,7 +1591,8 @@ public:
                         grow_node_legacy(G, X, r.data(), n, p, ws, 0, msub, 0, tp);
                     }
                     std::vector<int32_t> leaf_of;
-                    route_holdout(G, X, r.data(), K, n, hold, leaf_of);
+                    route_holdout(G, X, r.data(), K, n, hold, leaf_of,
+                                  (logistic && leaf_refit_all) ? hrow.data() : nullptr);
                     const double nh = std::max(1.0, G.h_cnt.empty() ? 1.0 : G.h_cnt[0]);
                     double root_sq = 0.0;
                     for (int k = 0; k < K; ++k) root_sq += G.h_sum[k] * G.h_sum[k] / nh;
@@ -1542,14 +1607,16 @@ public:
                             U(ws.rng) * (std::log(lam_hi) - std::log(lam_lo)));
                         prune_flags(G, K, lam, varh, collapsed, leaves);
                         exported_leaf_of(G, &collapsed, rep);
-                        if (logistic) newton_refit(G, K, rep, ws.idx, r.data(), hrow.data(), leaf_l2);
+                        if (logistic) newton_refit(G, K, rep, ws.idx, r.data(), hrow.data(), leaf_l2, leaf_refit_all != 0);
+                        else if (leaf_refit_all) mean_refit_all_rows(G, K, rep);
                         if (leaf_shrink >= 0.0) shrink_leaves(G, K, &collapsed, leaf_shrink);
                         if (linear_feats > 0 && K == 1 && !logistic)
                             fit_linear_leaves(G, rep, ws.idx, X, n, r.data(), linear_feats, linear_lambda);
                         export_member_safe(G, K, &collapsed, M, b * batch + t, 2);
                     } else {
                         exported_leaf_of(G, nullptr, rep);
-                        if (logistic) newton_refit(G, K, rep, ws.idx, r.data(), hrow.data(), leaf_l2);
+                        if (logistic) newton_refit(G, K, rep, ws.idx, r.data(), hrow.data(), leaf_l2, leaf_refit_all != 0);
+                        else if (leaf_refit_all) mean_refit_all_rows(G, K, rep);
                         if (linear_feats > 0 && K == 1 && !logistic)
                             fit_linear_leaves(G, rep, ws.idx, X, n, r.data(), linear_feats, linear_lambda);
                         export_member_safe(G, K, nullptr, M, b * batch + t, 0);
@@ -1571,6 +1638,21 @@ public:
                 });
 
                 ++n_batches;
+                if (weighted) {
+                    std::vector<double> share((size_t)p, 0.0);
+                    double tot = 0.0;
+                    for (int t = 0; t < batch; ++t) {
+                        const Tree& M = members[offset + (size_t)t];
+                        for (size_t k = 0; k < M.feat.size(); ++k)
+                            if (M.feat[k] >= 0) { share[(size_t)M.feat[k]] += M.gain[k]; tot += M.gain[k]; }
+                    }
+                    if (tot > 0.0) {
+                        const double decay = b == 0 ? 0.0 : 0.5;
+                        for (int f = 0; f < p; ++f) fgain[(size_t)f] = decay * fgain[(size_t)f] + (1.0 - decay) * share[(size_t)f] / tot;
+                    }
+                    for (int f = 0; f < p; ++f)
+                        fweights[(size_t)f] = std::pow(1.0 / (double)p + fgain[(size_t)f], feature_power);
+                }
                 if (nF > 0 && n_oob > 0) {
                     // mean of the holdout trees' predictions per oob row: tree
                     // t held out fold t mod F, so the trees are known from the
@@ -1603,7 +1685,21 @@ public:
                     pool.run(nc_tr + nc_v, [&](int64_t c) {
                         if (c < nc_tr) {
                             const int64_t lo = c * chunk * K, hi = std::min(n * K, lo + chunk * K);
-                            if (!logistic) {
+                            if (honest_residuals && nF > 0) {
+                                // each row moves by the shrunk mean of the trees
+                                // that did not train on it (an ordered-boosting
+                                // approximation at no extra cost)
+                                for (int64_t i = lo; i < hi; ++i) {
+                                    const int64_t row = i / K;
+                                    const int32_t f = fold_of[(size_t)row];
+                                    double acc = 0.0; int cnt = 0;
+                                    for (int t = f; t < batch; t += nF) {
+                                        acc += bt[(size_t)t * (size_t)n * K + (size_t)i]; ++cnt;
+                                    }
+                                    const double upd = shrink * acc / (double)std::max(1, cnt);
+                                    if (!logistic) r[(size_t)i] -= upd; else F[(size_t)i] += upd;
+                                }
+                            } else if (!logistic) {
                                 for (int t = 0; t < batch; ++t) {
                                     const double* pt = bt.data() + (size_t)t * (size_t)n * K;
                                     for (int64_t i = lo; i < hi; ++i) r[(size_t)i] -= step * pt[i];
@@ -1613,6 +1709,8 @@ public:
                                     const double* pt = bt.data() + (size_t)t * (size_t)n * K;
                                     for (int64_t i = lo; i < hi; ++i) F[(size_t)i] += step * pt[i];
                                 }
+                            }
+                            if (logistic) {
                                 const int64_t rlo = lo / K, rhi = hi / K;
                                 std::vector<double> pr((size_t)(rhi - rlo) * K);
                                 activate(F.data() + rlo * K, pr.data(), rhi - rlo);
@@ -2163,7 +2261,8 @@ PYBIND11_MODULE(_core, m) {
              py::arg("feat_lo"), py::arg("feat_hi"),
              py::arg("lam_lo"), py::arg("lam_hi"),
              py::arg("leaf_shrink"), py::arg("hist_bits"), py::arg("leaf_l2"), py::arg("loss"),
-             py::arg("linear_feats"), py::arg("linear_lambda"),
+             py::arg("linear_feats"), py::arg("linear_lambda"), py::arg("feature_power"),
+             py::arg("leaf_refit_all"), py::arg("honest_residuals"),
              py::arg("hybrid_min"), py::arg("seed"), py::arg("n_jobs"),
              "Grow the batch-boosted dictionary. Returns (n_members, n_batches, oob_design).")
         .def("predict_members", &Ensemble::predict_members,

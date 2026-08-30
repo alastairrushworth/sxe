@@ -1002,14 +1002,17 @@ time is the mean at each library's best thread count.
 \section{Results}\label{sec:results}
 
 \emph{Note on provenance.} The tables in this section were measured before the
-changes of Sections~\ref{sec:inflight} and~\ref{sec:litpass}. The suite was
-re-run after those changes with the same tuned configurations; the committed
-\code{results\_suite.csv} and the README table are that re-run. Headline
-movements: \SXE's shipped model is now smaller than LightGBM's on all nine
-datasets (1.04$\times$ on Covertype-30k to 40$\times$ on California), the
-median tuning gain falls from 9.5\% to 4.4\% against LightGBM's 3.3\%, and the
-accuracy tally stays four to five with Friedman1 moving to a clear \SXE\ win
-and Letter to a clear LightGBM one.
+changes of Sections~\ref{sec:inflight}, \ref{sec:litpass} and~\ref{sec:accpass}.
+The suite was re-run after those changes with both libraries re-searched; the
+committed \code{results\_suite.csv} and the README table are that re-run.
+Headline movements: tuned \SXE\ now wins six of nine on accuracy (California,
+Friedman1, Covertype-30k, Bank, Letter, Madelon), ties Covertype-full at
+$0.9977$ AUC, and loses Adult ($0.9247$ against $0.9305$) and Superconduct
+($9.49$ against $9.33$); its shipped model is smaller on eight of nine
+(1.4--21$\times$), Friedman1 being the exception. The median tuning gain is
+6.5\% against LightGBM's 3.3\%, and default models are now larger and slower to
+fit than LightGBM's defaults on most datasets --- the price stated in
+Section~\ref{sec:accpass}.
 
 \subsection{Head-to-head, both tuned}
 

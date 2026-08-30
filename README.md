@@ -2,10 +2,10 @@
 
 **Batch-boosted, holdout-pruned, sparsely re-weighted histogram trees, with a scikit-learn API.**
 
-Against a **tuned** LightGBM across nine datasets, SXE wins on accuracy on four and
-loses on five, with a smaller model on all nine (2.6× to 40×, measured on the bytes
-each library actually ships). Its predictions are **bit-identical regardless of how
-many threads you run it on**.
+Against a **tuned** LightGBM across nine datasets, SXE wins on accuracy on six, ties
+one and loses two, with a smaller model on eight of nine (1.4× to 21×, measured on the
+bytes each library actually ships). Its predictions are **bit-identical regardless of
+how many threads you run it on**.
 
 ```python
 from sklearn.datasets import fetch_california_housing
@@ -65,7 +65,7 @@ source alongside it).
 
 | | |
 |---|---|
-| **Small models** | Smaller than a tuned LightGBM on all nine benchmark datasets, by 1.04× (covtype-binary) to 40× (california), measured on what each library actually writes: SXE's blob plus its bin table against the leanest encoding of LightGBM's trees. Worth checking on your data if the model ships to an edge device, into a container image, or through a serving path where load time matters. |
+| **Small models** | Smaller than a tuned LightGBM on eight of nine benchmark datasets, by 1.4× (bank) to 21× (madelon), measured on what each library actually writes: SXE's blob plus its bin table against the leanest encoding of LightGBM's trees. Larger on friedman1 (1.7 MB vs 0.6). Worth checking on your data if the model ships to an edge device, into a container image, or through a serving path where load time matters. |
 | **Reproducibility** | Per-tree RNG seeds derive from the tree index, never from scheduling order, so `n_jobs` is a pure performance knob: same seed, same predictions, bit for bit. This holds within a platform — the C++ standard library's random distributions are implementation-defined, so a seed grows different trees on Linux and macOS. |
 | **Parallel structure** | Trees within a batch are independent. Only the batch-level residual update is sequential, so growth parallelises where sequential GBDT cannot. |
 
@@ -176,36 +176,37 @@ defaults, so a tuned row can never be worse than its default row on the selectio
 fold. **Size** is what each library would actually ship: SXE's serialized blob plus
 the bin edges its trees cut at; for LightGBM the leanest encoding of its trees (a
 float64 threshold, explicit children, no bin table). **Time** is each library at its
-own best thread count. The SXE tuned configurations were searched before the changes
-in `paper/sxe.tex` §"A literature-driven pass" landed and reused as-is.
+own best thread count. Both searches were run under the current code; the SXE search
+space is described in `paper/sxe.tex` §"An accuracy pass".
 
 | Dataset | Metric | LightGBM | SXE | Size MB LGBM / SXE |
 |---|---|---|---|---|
-| california (20,640 × 8) | rmse ↓ | **0.4409 ± 0.0095** | 0.4464 ± 0.0081 | 3.771 / **0.095** |
-| friedman1 + noise (25,000 × 25) | rmse ↓ | 1.0695 ± 0.0112 | **1.0403 ± 0.0122** | 0.632 / **0.248** |
-| superconduct (21,263 × 81) | rmse ↓ | **9.3313 ± 0.3171** | 9.5769 ± 0.3179 | 7.466 / **0.425** |
-| covtype binary (30,000 × 54) | auc ↑ | 0.9547 ± 0.0031 | **0.9590 ± 0.0024** | 1.308 / **1.260** |
-| covtype full (581,012 × 54) | auc ↑ | **0.9977 ± 0.0001** | 0.9951 ± 0.0002 | 13.856 / **5.034** |
-| adult (48,842 × 14) | auc ↑ | **0.9305 ± 0.0016** | 0.9235 ± 0.0026 | 0.612 / **0.117** |
-| bank marketing (45,211 × 16) | auc ↑ | 0.9338 ± 0.0017 | **0.9342 ± 0.0025** | 0.224 / **0.057** |
-| letter, 26 classes (20,000 × 16) | accuracy ↑ | **0.9661 ± 0.0018** | 0.9608 ± 0.0018 | 6.724 / **5.022** |
-| madelon (2,600 × 500) | auc ↑ | 0.8873 ± 0.0089 | **0.9044 ± 0.0059** | 0.458 / **0.014** |
+| california (20,640 × 8) | rmse ↓ | 0.4409 ± 0.0089 | **0.4396 ± 0.0082** | 3.771 / **1.243** |
+| friedman1 + noise (25,000 × 25) | rmse ↓ | 1.0695 ± 0.0106 | **1.0347 ± 0.0130** | **0.632** / 1.673 |
+| superconduct (21,263 × 81) | rmse ↓ | **9.3313 ± 0.2989** | 9.4895 ± 0.2719 | 7.466 / **0.484** |
+| covtype binary (30,000 × 54) | auc ↑ | 0.9547 ± 0.0030 | **0.9576 ± 0.0036** | 1.308 / **0.437** |
+| covtype full (581,012 × 54) | auc ↑ | 0.9977 ± 0.0001 | 0.9977 ± 0.0001 | 13.856 / **5.564** |
+| adult (48,842 × 14) | auc ↑ | **0.9305 ± 0.0015** | 0.9247 ± 0.0017 | 0.612 / **0.158** |
+| bank marketing (45,211 × 16) | auc ↑ | 0.9338 ± 0.0016 | **0.9367 ± 0.0021** | 0.224 / **0.165** |
+| letter, 26 classes (20,000 × 16) | accuracy ↑ | 0.9661 ± 0.0018 | **0.9678 ± 0.0011** | 6.724 / **0.965** |
+| madelon (2,600 × 500) | auc ↑ | 0.8873 ± 0.0084 | **0.9122 ± 0.0033** | 0.458 / **0.022** |
 
-**Accuracy: four to SXE, five to LightGBM.** SXE's wins on friedman1, covtype-binary
-and madelon are outside seed-to-seed spread and bank marketing is a tie; LightGBM's
-on covtype-full, adult, superconduct and letter are clear, and california is within
-spread.
+**Accuracy: six to SXE, one tie, two to LightGBM.** By paired seed differences, SXE's
+wins on friedman1 (t = 7.9), bank (9.0), madelon (5.4) and covtype-binary (2.2) are
+outside seed-to-seed spread and letter (1.8) and california (0.6) are within it;
+covtype-full is an exact tie on AUC (log-loss 0.0607 vs 0.0609); LightGBM's wins on
+adult (t = 36.7) and superconduct (2.7) are clear.
 
 The shape of it: SXE's randomization is variance reduction. It wins where variance
 dominates — noise, p ≫ n, many irrelevant features — and loses where bias dominates:
 large n, smooth strong signal, correlated informative features.
 
-**Size is now a systematic win.** SXE's shipped model is smaller on all nine, from
-1.04× on covtype-binary (where the tuned configuration spends 169k leaves) to 40× on
-california and 33× on madelon. Three things did it: 16-bit leaf codes, shipping only
-the bin edges the trees cut at, and the relaxed weight refit keeping fewer batches.
-Nothing in either search penalises size; LightGBM's search drifts to very large
-models.
+**Size is a systematic win at tuned accuracy.** SXE's shipped model is smaller on eight
+of nine — 21× on madelon, 15× on superconduct, 7× on letter, 3× on california and
+covtype — and larger only on friedman1, where the search bought its 3% RMSE win with
+213k leaves. Nothing in either search penalises size; LightGBM's search drifts to very
+large models. The accuracy gains of the last pass cost size at *defaults*, though:
+see the next section.
 
 ### The defaults are the weak point
 
@@ -214,14 +215,18 @@ this need tuning":
 
 | | SXE | LightGBM |
 |---|---|---|
-| Median error reduction from tuning | **4.4%** | 3.3% |
+| Median error reduction from tuning | **6.5%** | 3.3% |
 | Datasets where tuning helps more | **5 of 9** | 4 of 9 |
 
-Down from 9.5% and 8 of 9 before the defaults revision and the relaxed refit, and the
-remaining gap is concentrated: covtype-binary (37%), covtype-full (34%) and letter
-(27%) want deeper, wider trees than the defaults grow; on the other six the two
-libraries' defaults are now equally close to their tuned selves. Read the SXE column
-above as a *tuned* SXE on those three.
+The gap widened again in the last pass because the wider search found much better
+configurations, not because the defaults got worse: at defaults SXE beats LightGBM's
+defaults on bank, friedman1, madelon and covtype-full and loses on adult, california,
+covtype-binary, letter and superconduct. Default models are also now larger than
+LightGBM's defaults on most datasets (adult 0.57 MB vs 0.13, covtype-full 22 MB vs 2.5)
+and fits are 5–20× slower — the price of trees that see 3/4 of the rows, Newton leaves
+and a weight fit with less selection noise. `holdout_folds`, `weight_tol` and
+`max_iter` are the dials that trade that back; the tuned column is where the size
+claim holds.
 
 Reproduce with:
 

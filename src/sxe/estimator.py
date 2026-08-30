@@ -187,6 +187,22 @@ class _BaseSXE(BaseEstimator):
         clipped to [0, 1] -- so a leaf the holdout contradicts is damped and
         one it confirms is kept whole. The value is the strength of the pull
         toward 1 (in holdout rows); 0 is the raw holdout fit. None disables.
+    leaf_refit : {"train", "all"}, default="train"
+        Which rows an exported leaf's value is estimated from. "train": the
+        rows the tree grew on. "all": those plus the holdout rows that reach
+        the leaf -- structure and pruning are decided without them, so the
+        value may use them.
+    honest_residuals : bool, default=False
+        Under ``holdout="batch"``, update each training row's residual with
+        only the batch's trees that did not train on it, an approximation of
+        ordered boosting at no extra cost.
+    feature_weighting : float, default=0.0
+        Gain-informed candidate sampling. After every batch an exponential
+        moving average of each feature's share of split gain is updated, and
+        the next batch draws its K candidate features per node with
+        probability rising in ``(1/p + share) ** feature_weighting`` instead
+        of uniformly. 0 keeps the uniform draw; 1 is proportional. Features
+        that have never split keep a floor of 1/p, so nothing is excluded.
     linear_leaves : int, default=0
         Regressor only. If > 0, every leaf carries a ridge model in the bin
         ids of up to this many of the features split on the path above it
@@ -300,6 +316,9 @@ class _BaseSXE(BaseEstimator):
         subsample_range=(0.4, 0.75),
         prune_strength_range=(1e-3, 1.0),
         leaf_shrinkage=None,
+        leaf_refit="train",
+        honest_residuals=False,
+        feature_weighting=0.0,
         linear_leaves=0,
         linear_lambda=1.0,
         leaf_l2=0.0,
@@ -336,6 +355,9 @@ class _BaseSXE(BaseEstimator):
         self.subsample_range = subsample_range
         self.prune_strength_range = prune_strength_range
         self.leaf_shrinkage = leaf_shrinkage
+        self.leaf_refit = leaf_refit
+        self.honest_residuals = honest_residuals
+        self.feature_weighting = feature_weighting
         self.linear_leaves = linear_leaves
         self.linear_lambda = linear_lambda
         self.leaf_l2 = leaf_l2
@@ -402,6 +424,10 @@ class _BaseSXE(BaseEstimator):
             raise ValueError(f"hybrid_min must be >= 1, got {self.hybrid_min}")
         if self.loss not in ("squared", "logistic"):
             raise ValueError(f"loss must be 'squared' or 'logistic', got {self.loss!r}")
+        if self.leaf_refit not in ("train", "all"):
+            raise ValueError(f"leaf_refit must be 'train' or 'all', got {self.leaf_refit!r}")
+        if not self.feature_weighting >= 0:
+            raise ValueError(f"feature_weighting must be >= 0, got {self.feature_weighting}")
         if not 0 <= int(self.linear_leaves) <= 255:
             raise ValueError(f"linear_leaves must be in [0, 255], got {self.linear_leaves}")
         if not self.linear_lambda > 0:
@@ -695,6 +721,9 @@ class _BaseSXE(BaseEstimator):
             loss=1 if self._logistic() else 0,
             linear_feats=int(self.linear_leaves) if not self._is_classifier() else 0,
             linear_lambda=float(self.linear_lambda),
+            feature_power=float(self.feature_weighting),
+            leaf_refit_all=1 if self.leaf_refit == "all" else 0,
+            honest_residuals=1 if self.honest_residuals else 0,
             hybrid_min=int(self.hybrid_min),
             seed=int(rng.integers(2**63 - 1)),
             n_jobs=n_jobs,
@@ -715,7 +744,13 @@ class _BaseSXE(BaseEstimator):
             # of the weight fit mix both sources
             P_all = np.vstack([P_oob, Pb])
             y_all = np.concatenate([np.ascontiguousarray(ytr[oob_idx]).ravel(), yflat])
-            order = np.random.default_rng(0).permutation(len(y_all))
+            # shuffle whole samples: a K-output sample occupies K consecutive
+            # rows that the softmax working response must keep together
+            n_samp = len(y_all) // n_out
+            order = (
+                np.random.default_rng(0).permutation(n_samp)[:, None] * n_out
+                + np.arange(n_out)[None, :]
+            ).ravel()
             Pb_fit, y_fit = np.ascontiguousarray(P_all[order]), y_all[order]
         else:
             Pb_fit, y_fit = Pb, yflat

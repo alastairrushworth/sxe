@@ -13,8 +13,10 @@
   },
   "adult/SXE": {
     "params": {
-      "batch_size": 16,
-      "learning_rate": 0.05452298318464204,
+      "batch_size": 4,
+      "holdout": "batch",
+      "holdout_folds": 8,
+      "learning_rate": 0.0736976021634519,
       "max_depth_choices": [
         10,
         12,
@@ -24,25 +26,21 @@
         0.5,
         1.0
       ],
-      "max_iter": 250,
+      "max_iter": 600,
       "min_samples_leaf_range": [
-        2,
-        15
+        5,
+        30
       ],
-      "n_iter_no_change": 20,
-      "n_thresholds": 3,
+      "n_iter_no_change": 8,
+      "n_thresholds": 2,
       "prune_strength_range": [
-        0.01,
-        2.0
+        0.001,
+        1.0
       ],
-      "splitter": "random",
-      "subsample_range": [
-        0.5,
-        0.8
-      ],
+      "splitter": "best",
       "validation_fraction": 0.1
     },
-    "search_loss": -0.9234608298336501
+    "search_loss": -0.9244787426029965
   },
   "bank_marketing/LightGBM": {
     "params": {
@@ -58,18 +56,20 @@
   },
   "bank_marketing/SXE": {
     "params": {
-      "batch_size": 12,
-      "learning_rate": 0.06700764553000978,
+      "batch_size": 4,
+      "holdout": "batch",
+      "holdout_folds": 8,
+      "learning_rate": 0.0736976021634519,
       "max_depth_choices": [
         10,
         12,
         14
       ],
       "max_features_range": [
-        0.85,
+        0.5,
         1.0
       ],
-      "max_iter": 250,
+      "max_iter": 600,
       "min_samples_leaf_range": [
         5,
         30
@@ -78,16 +78,12 @@
       "n_thresholds": 2,
       "prune_strength_range": [
         0.001,
-        0.05
+        1.0
       ],
-      "splitter": "random",
-      "subsample_range": [
-        0.5,
-        0.8
-      ],
-      "validation_fraction": 0.18
+      "splitter": "best",
+      "validation_fraction": 0.1
     },
-    "search_loss": -0.945370667113699
+    "search_loss": -0.9472212498171605
   },
   "california/LightGBM": {
     "params": {
@@ -103,8 +99,10 @@
   },
   "california/SXE": {
     "params": {
-      "batch_size": 4,
-      "learning_rate": 0.05,
+      "batch_size": 8,
+      "holdout": "batch",
+      "holdout_folds": 8,
+      "learning_rate": 0.025984634229385007,
       "max_depth_choices": [
         0
       ],
@@ -112,25 +110,22 @@
         0.85,
         1.0
       ],
-      "max_iter": 1200,
-      "max_leaf_nodes": 63,
+      "max_iter": 1500,
+      "max_leaf_nodes": 255,
       "min_samples_leaf_range": [
-        10,
-        25
+        3,
+        20
       ],
-      "n_alphas": 15,
-      "n_iter_no_change": 25,
+      "n_iter_no_change": 3,
+      "n_thresholds": 2,
       "prune_strength_range": [
         0.001,
         0.05
       ],
-      "subsample_range": [
-        0.9,
-        1.0
-      ],
-      "validation_fraction": 0.15
+      "splitter": "best",
+      "validation_fraction": 0.1
     },
-    "search_loss": 0.46641726616526774
+    "search_loss": 0.4640454899144604
   },
   "covtype_binary/LightGBM": {
     "params": {
@@ -146,24 +141,23 @@
   },
   "covtype_binary/SXE": {
     "params": {
-      "batch_size": 16,
-      "bundle_binary_features": false,
-      "learning_rate": 0.2304404052668637,
+      "batch_size": 8,
+      "bundle_binary_features": true,
+      "holdout": "random",
+      "learning_rate": 0.2665202111592438,
       "max_depth_choices": [
-        8,
-        10,
-        12
+        0
       ],
       "max_features_range": [
-        0.85,
+        0.5,
         1.0
       ],
-      "max_iter": 250,
+      "max_iter": 600,
       "min_samples_leaf_range": [
-        2,
-        15
+        3,
+        20
       ],
-      "n_iter_no_change": 3,
+      "n_iter_no_change": 40,
       "n_thresholds": 3,
       "prune_strength_range": [
         0.001,
@@ -171,12 +165,12 @@
       ],
       "splitter": "random",
       "subsample_range": [
-        0.9,
-        1.0
+        0.5,
+        0.8
       ],
       "validation_fraction": 0.1
     },
-    "search_loss": -0.949302219850165
+    "search_loss": -0.946431968906284
   },
   "covtype_full/LightGBM": {
     "params": {
@@ -192,9 +186,10 @@
   },
   "covtype_full/SXE": {
     "params": {
-      "batch_size": 16,
+      "batch_size": 12,
       "bundle_binary_features": false,
-      "learning_rate": 0.2304404052668637,
+      "holdout": "random",
+      "learning_rate": 0.23638128429934757,
       "max_depth_choices": [
         8,
         10,
@@ -204,25 +199,25 @@
         0.85,
         1.0
       ],
-      "max_iter": 200,
+      "max_iter": 600,
       "min_samples_leaf_range": [
-        2,
-        15
+        10,
+        60
       ],
       "n_iter_no_change": 3,
-      "n_thresholds": 3,
+      "n_thresholds": 2,
       "prune_strength_range": [
-        0.001,
-        0.05
+        0.01,
+        2.0
       ],
-      "splitter": "random",
+      "splitter": "best",
       "subsample_range": [
         0.9,
         1.0
       ],
       "validation_fraction": 0.1
     },
-    "search_loss": -0.9947660906486114
+    "search_loss": -0.9970076072255032
   },
   "friedman1_noise/LightGBM": {
     "params": {
@@ -238,36 +233,33 @@
   },
   "friedman1_noise/SXE": {
     "params": {
-      "batch_size": 12,
-      "learning_rate": 0.0540330684355572,
+      "batch_size": 16,
+      "holdout": "batch",
+      "holdout_folds": 8,
+      "learning_rate": 0.012789141570901934,
       "max_depth_choices": [
-        6,
-        7,
-        8
+        0
       ],
       "max_features_range": [
-        0.5,
-        1.0
+        0.35,
+        0.65
       ],
-      "max_iter": 250,
+      "max_iter": 600,
+      "max_leaf_nodes": 63,
       "min_samples_leaf_range": [
-        2,
-        15
+        3,
+        20
       ],
-      "n_iter_no_change": 8,
+      "n_iter_no_change": 20,
       "n_thresholds": 3,
       "prune_strength_range": [
-        0.01,
-        2.0
+        0.001,
+        1.0
       ],
       "splitter": "random",
-      "subsample_range": [
-        0.2,
-        0.35
-      ],
-      "validation_fraction": 0.15
+      "validation_fraction": 0.18
     },
-    "search_loss": 1.0546251895226033
+    "search_loss": 1.0405633908554044
   },
   "letter/LightGBM": {
     "params": {
@@ -283,36 +275,36 @@
   },
   "letter/SXE": {
     "params": {
-      "batch_size": 16,
-      "learning_rate": 0.05452298318464204,
+      "batch_size": 8,
+      "holdout": "random",
+      "learning_rate": 0.06944630467106172,
       "max_depth_choices": [
-        10,
-        12,
-        14
+        0
       ],
       "max_features_range": [
         0.5,
         1.0
       ],
-      "max_iter": 150,
+      "max_iter": 300,
+      "max_leaf_nodes": 63,
       "min_samples_leaf_range": [
-        2,
-        15
+        5,
+        30
       ],
-      "n_iter_no_change": 20,
-      "n_thresholds": 3,
+      "n_iter_no_change": 8,
+      "n_thresholds": 2,
       "prune_strength_range": [
         0.01,
         2.0
       ],
-      "splitter": "random",
+      "splitter": "best",
       "subsample_range": [
-        0.5,
-        0.8
+        0.9,
+        1.0
       ],
-      "validation_fraction": 0.1
+      "validation_fraction": 0.18
     },
-    "search_loss": -0.96875
+    "search_loss": -0.9691666666666666
   },
   "madelon/LightGBM": {
     "params": {
@@ -329,35 +321,36 @@
   "madelon/SXE": {
     "params": {
       "batch_size": 16,
-      "learning_rate": 0.05452298318464204,
+      "holdout": "random",
+      "learning_rate": 0.05457828840219483,
       "max_depth_choices": [
+        8,
         10,
-        12,
-        14
+        12
       ],
       "max_features_range": [
         0.5,
         1.0
       ],
-      "max_iter": 250,
+      "max_iter": 600,
       "min_samples_leaf_range": [
-        2,
-        15
+        5,
+        30
       ],
-      "n_iter_no_change": 20,
-      "n_thresholds": 3,
+      "n_iter_no_change": 40,
+      "n_thresholds": 2,
       "prune_strength_range": [
-        0.01,
-        2.0
+        0.001,
+        1.0
       ],
-      "splitter": "random",
+      "splitter": "best",
       "subsample_range": [
         0.5,
         0.8
       ],
-      "validation_fraction": 0.1
+      "validation_fraction": 0.15
     },
-    "search_loss": -0.9098044049967127
+    "search_loss": -0.9052021696252465
   },
   "superconduct/LightGBM": {
     "params": {
@@ -373,35 +366,34 @@
   },
   "superconduct/SXE": {
     "params": {
-      "batch_size": 16,
-      "learning_rate": 0.05452298318464204,
+      "batch_size": 8,
+      "holdout": "random",
+      "learning_rate": 0.18869450515385874,
       "max_depth_choices": [
-        10,
-        12,
-        14
+        0
       ],
       "max_features_range": [
-        0.5,
+        0.85,
         1.0
       ],
-      "max_iter": 250,
+      "max_iter": 600,
       "min_samples_leaf_range": [
-        2,
-        15
+        3,
+        20
       ],
       "n_iter_no_change": 20,
-      "n_thresholds": 3,
+      "n_thresholds": 2,
       "prune_strength_range": [
-        0.01,
-        2.0
+        0.001,
+        0.05
       ],
       "splitter": "random",
       "subsample_range": [
-        0.5,
-        0.8
+        0.9,
+        1.0
       ],
-      "validation_fraction": 0.1
+      "validation_fraction": 0.15
     },
-    "search_loss": 10.052497986820352
+    "search_loss": 9.592958873469936
   }
 }
