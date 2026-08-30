@@ -224,7 +224,9 @@ the Brier-score reduction --- so leaf means are conditional-probability
 estimates and a squared-error split on 0/1 targets is equivalent to a Gini
 split up to constants. There is no logistic loss and there are no second-order
 (Newton) leaf values; Section~\ref{sec:limitations} returns to what this costs.
-Multiclass is a one-vs-rest reduction over the binary core.
+Multiclass targets are one-hot encoded and fitted jointly: one ensemble whose
+trees carry a $K$-vector leaf, with squared error summed over the $K$ columns
+(Section~\ref{sec:predict}).
 
 \SXE\ partitions the training data once, before anything else happens. A
 fraction $\rho_{\text{val}}$ (\code{validation\_fraction}, default $0.18$) is
@@ -551,6 +553,21 @@ cross-validated solution collapses entirely to the intercept, a tiny-$\alpha$
 positive fit is substituted so the model remains an ensemble rather than a
 constant.
 
+\paragraph{The relaxed refit.} The lasso's penalty does two jobs at once: it
+chooses which batches survive, and it shrinks the weights of the survivors. The
+second is a bias the selection does not need. \SXE\ therefore fits a
+\emph{relaxed} lasso \cite{meinshausen2007relaxed}: for every $\alpha$ on the
+path the penalised solution $w_\alpha$ defines a support, a non-negative
+least-squares refit $\tilde w_\alpha$ on that support removes the shrinkage,
+and the candidate solutions are the blends
+$\phi\, w_\alpha + (1-\phi)\, \tilde w_\alpha$ for
+$\phi \in \{1, 0.75, 0.5, 0.25, 0\}$. The pair $(\alpha, \phi)$ is chosen by the
+same 3-fold cross-validation, so a stronger penalty --- fewer batches, a smaller
+model --- can win when the refit repairs what it cost. Measured over seven
+datasets at three seeds (Section~\ref{sec:inflight}) the relaxed fit improved
+every regression task and most classification tasks at equal or smaller size;
+\code{weight\_refit=None} restores the plain lasso.
+
 Four design choices deserve justification.
 
 \paragraph{Why a lasso at all.} By the stagewise--lasso correspondence
@@ -632,15 +649,22 @@ ordinary logistic solver optimises the smoothed objective exactly. If the fold
 cannot identify a calibration --- one class only, a constant score, or a fitted
 map that is non-increasing --- the calibrator is dropped and the raw score is
 clipped to $[10^{-6}, 1-10^{-6}]$ instead, so a bad fit can never reorder the
-scores. Under the one-vs-rest reduction this decision is made for all classes
-together: a rare class whose validation fold contains no positives cannot be
-calibrated, and mapping the others while clipping that one would normalise a row
-across two different scales.
+scores. For a multiclass model this decision is made for all classes together:
+a rare class whose validation fold contains no positives cannot be calibrated,
+and mapping the others while clipping that one would normalise a row across
+two different scales.
 
-Multiclass is one-vs-rest: one complete ensemble per class, with per-class
-scores normalised to sum to one. This is a reduction, not a native objective,
-and it costs a full ensemble per class --- on the 26-class Letter dataset, 26
-ensembles.
+Multiclass (\code{multiclass="vector"}, the default) grows one ensemble whose
+leaves hold a $K$-vector: the target is the one-hot matrix $Y \in
+\{0,1\}^{n \times K}$, every split is scored on the variance-reduction gain
+summed over the $K$ residual columns, the holdout pruning criterion sums the
+$K$ leaf SSEs, and one batch weight serves all $K$ outputs (the weight fit's
+design matrix stacks the $K$ outputs of each validation row). Structure is
+therefore shared across classes and only the leaves are per class
+\cite{ponomareva2017compact}; each class score is Platt-mapped and the row is
+normalised to a distribution. \code{multiclass="ovr"} keeps the older
+one-vs-rest reduction --- one complete binary ensemble per class --- which
+Section~\ref{sec:litpass} compares on Letter.
 
 \subsection{Determinism}\label{sec:determinism}
 
@@ -715,14 +739,34 @@ load.
 \item \emph{gain}: it existed for \code{feature\_importances\_}, which is now
 accumulated once at fit time into a length-$p$ vector.
 \end{itemize}
-What remains is 9 bytes per internal node, 8 per leaf, and one bit per node
-recording which is which. The bin table is additionally pruned to the columns
-the retained trees actually index; on Madelon at defaults the model splits on
-61 of 500 features and was carrying 421\,kB of quantile edges for the other
-439. Unused columns transform to bin 0, which is safe precisely because nothing
-reads them, and a one-vs-rest classifier shares a single table across its
-sub-models covering the union of the columns they use, rather than each
-sub-model holding a pruned copy of the same edges.
+The current format (version 3) narrows what remains further:
+\begin{itemize}[leftmargin=1.5em,itemsep=1pt]
+\item \emph{feature and child ids} take two bytes when the model has at most
+65{,}535 features and the tree at most 65{,}535 nodes, else four;
+\item \emph{leaf values} are stored as codes under a per-tree affine map,
+$v = a_t + b_t q$, with $q$ a 16-bit integer for scalar leaves and an 8-bit
+integer for $K$-vector leaves. The same rounding is applied to the model in
+memory at fit time, so the artefact and the object that reports its size
+predict identically. Each leaf enters a prediction with weight $w_b/B$ as one
+of hundreds of summands, so a rounding of $1/65535$ (or $1/255$) of the tree's
+leaf range is far below the ensemble's noise floor; Painsky and Rosset
+\cite{painsky2019compression} report no measurable loss at seven bits on plain
+averaged forests, a harsher setting;
+\item \emph{bin edges} are float32, rounded \emph{before} the training data is
+binned so the trees on disk are the trees that were grown, and only the edges
+some retained tree actually cuts at are kept: a cut ``bin $\le t$'' is
+``$x < e_t$'' and needs exactly one edge, so the table shrinks from up to 255
+edges per used column to the number of distinct cuts, and the trees' thresholds
+are renumbered to match. A cut at or beyond the last edge separates missing
+values from every finite one and needs no edge at all.
+\end{itemize}
+That is 5 bytes per internal node and 2 per leaf on models of ordinary width,
+plus one bit per node recording which is which. Unused columns transform to
+bin 0, which is safe precisely because nothing reads them, and a one-vs-rest
+classifier shares a single table across its sub-models covering the union of
+the cuts they use. Measured against the 9/8-byte format on seven datasets at
+three seeds, the trees shrink 2.1--2.6$\times$ and the whole model 7--10$\times$
+on Madelon, where the bin table had been the model.
 
 An earlier version of this format wrote 29 bytes per node --- storing
 \code{gain} everywhere, \code{feat}/\code{thr}/\code{left}/\code{right} on
@@ -924,6 +968,16 @@ thread count so that repeated thread settings do not double-count;
 time is the mean at each library's best thread count.
 
 \section{Results}\label{sec:results}
+
+\emph{Note on provenance.} The tables in this section were measured before the
+changes of Sections~\ref{sec:inflight} and~\ref{sec:litpass}. The suite was
+re-run after those changes with the same tuned configurations; the committed
+\code{results\_suite.csv} and the README table are that re-run. Headline
+movements: \SXE's shipped model is now smaller than LightGBM's on all nine
+datasets (1.04$\times$ on Covertype-30k to 40$\times$ on California), the
+median tuning gain falls from 9.5\% to 4.4\% against LightGBM's 3.3\%, and the
+accuracy tally stays four to five with Friedman1 moving to a clear \SXE\ win
+and Letter to a clear LightGBM one.
 
 \subsection{Head-to-head, both tuned}
 
@@ -1278,9 +1332,10 @@ platform, and is tested. It does not hold across C++ standard libraries
 (Section~\ref{sec:determinism}).
 
 \paragraph{Method limits.} Squared error throughout; no logistic loss; no
-second-order leaf values. Multiclass is a one-vs-rest reduction costing one
-ensemble per class --- on Letter, 26 ensembles, 650k leaves and $2.7\times$
-LightGBM's model for slightly worse accuracy. Features are capped at 255 finite
+second-order leaf values. Multiclass shares structure across classes through
+$K$-vector leaves but still minimises squared error on one-hot targets, and on
+Letter at defaults that costs 0.5--1.0 accuracy points against the one-vs-rest
+reduction it replaced (Section~\ref{sec:litpass}). Features are capped at 255 finite
 bins plus the missing bin. There is no general categorical handling beyond
 binary bundling, and no \code{sample\_weight}.
 
@@ -1376,8 +1431,9 @@ re-pick within the current one. This is the highest-value work in the list by a
 distance, because it is the difference between the method and the product.
 \item \textbf{Newton (second-order) leaf values and a learning-rate schedule},
 both aimed at the bias-side gap.
-\item \textbf{Logistic loss and a native multiclass objective}, which would
-retire the one-vs-rest reduction and the $26\times$ cost on Letter.
+\item \textbf{Logistic loss and a multinomial objective} on top of the shared
+$K$-vector structure, which is where the remaining Letter gap most plausibly
+lives.
 \item \textbf{A size-budgeted evaluation}, so the size claim answers the
 question the use case poses.
 \item \textbf{A GPU port}, for which the batch structure is unusually
@@ -1389,8 +1445,9 @@ over raw values, and the weight fit is one small GEMM plus coordinate descent.
 \subsection{Changes landed since the benchmark run}\label{sec:inflight}
 
 Four changes have landed since the results of Section~\ref{sec:results} were
-measured. None of them alters the method; two of them change what a user gets,
-and the committed benchmark output predates all four.
+measured. None of them alters the method; two of them change what a user gets.
+The committed benchmark output has since been regenerated (see the note at the
+head of Section~\ref{sec:results}).
 
 \emph{Missing-value support}, as described in Section~\ref{sec:binning}. This
 removes the preprocessing burden priced in Section~\ref{sec:results} ---
@@ -1426,6 +1483,85 @@ trajectory length.
 \emph{A leaf-wise memory fix} (Section~\ref{sec:growth}) and a publishing path:
 a \code{v*} tag now pushes wheels to PyPI by trusted publishing, though the
 package is not yet installable from PyPI.
+
+\subsection{A literature-driven pass}\label{sec:litpass}
+
+A second set of changes came from a survey of the tree-ensemble literature
+for levers that would improve accuracy, training speed or model size without
+paying in another dimension. Each was implemented behind a switch, measured on
+seven datasets (California, Friedman1, Superconduct, Covertype-binary, Adult,
+Bank marketing, Madelon) at three seeds against the defaults and the tuned
+configurations, and adopted as a default only where the measurement supported
+it. The regression harness lives in the session record rather than the
+repository; the full suite was re-run afterwards.
+
+\paragraph{Adopted.}
+\begin{itemize}[leftmargin=1.5em,itemsep=2pt]
+\item \emph{Format version 3} (Section~\ref{sec:size}): 16-bit leaf codes,
+float32 used-only bin edges, narrow ids. Trees 2.1--2.6$\times$ smaller
+everywhere, models 7--10$\times$ smaller on Madelon; accuracy unchanged on the
+integer-featured datasets and within $\pm 0.002$ elsewhere (float32 edge
+rounding moves a few bin boundaries).
+\item \emph{Leaf-range predictions} (Section~\ref{sec:boost}): after growth a
+subsample row's leaf is implicit in its partition range and a holdout row's leaf
+was recorded while routing, so the per-tree prediction on the training fold no
+longer walks the tree; the residual update is row-parallel in a fixed tree
+order. Bit-identical output; 5--11\% faster on the small datasets.
+\item \emph{Sorted row ids with stable partitions} (Section~\ref{sec:growth}):
+every histogram gather then runs in increasing address order. This changes the
+order in which floating-point sums are folded, so it is deterministic but not
+bit-identical to the previous build; accuracy moved within noise. With the
+previous item, single-threaded growth on a 200k$\times$60 synthetic problem
+fell from 21.6\,s to 17.6\,s ($1.23\times$); at ten threads the two builds are
+within 5\%.
+\item \emph{The relaxed refit} (Section~\ref{sec:weights}): RMSE down on
+California ($-0.001$ default, $-0.005$ tuned), Friedman1 ($-0.007$),
+Superconduct ($-0.14$ default, $-0.08$ tuned); AUC up on Covertype-binary
+($+0.0016$) and Adult; models 0--12\% smaller. Madelon at defaults lost 0.002
+AUC.
+\item \emph{Vector leaves for multiclass} (Section~\ref{sec:predict}), one
+ensemble whose trees carry a $K$-vector leaf with the gain summed over the $K$
+one-hot residual columns \cite{ponomareva2017compact}. On Letter (26 classes)
+this trains $4.4\times$ faster than one-vs-rest and, with 8-bit leaf codes,
+ships a 1.8\,MB model against 2.9\,MB at defaults; accuracy at defaults is
+0.5--1.0 points lower (0.9475 / 0.9443 against 0.9520 / 0.9543 on two seeds)
+and equal under the tuned configuration (0.9623 / 0.9615 against 0.9627 /
+0.9620). That configuration was searched for one-vs-rest, and under it the
+vector model is larger (5.6\,MB against 4.3\,MB). The default is the vector
+model on the strength of the size and speed; \code{multiclass="ovr"} keeps the
+reduction, and the accuracy gap at defaults is recorded here rather than
+argued away.
+\end{itemize}
+
+\paragraph{Measured and left opt-in.}
+\begin{itemize}[leftmargin=1.5em,itemsep=2pt]
+\item \emph{Holdout-fitted leaf step size} (\code{leaf\_shrinkage};
+\cite{park2018paloboost}): each exported leaf's training mean is multiplied by
+the holdout-optimal factor $(\sum_h r/\mu + \lambda)/(n_h + \lambda)$ clipped
+to $[0,1]$. AUC $+0.0007$ to $+0.006$ on the classification sets, but RMSE
+worse on every regression set ($+0.001$ to $+0.006$) and models 5--20\%
+larger, because damped leaves slow the boosting trajectory. Not a default.
+\item \emph{Quantized histograms} (\code{hist\_bits};
+\cite{shi2022quantized}): residuals rounded stochastically to $b$ bits per
+tree, splits scored from integer histograms, leaf values exact. At four bits
+accuracy is within noise on the classification sets and better on Friedman1,
+but Superconduct loses 0.9--1.5\% RMSE; and while it ran $2.5\times$ faster on
+Covertype-binary under a loaded machine, on a quiet one it was \emph{slower}
+than the exact path on the 200k$\times$60 problem (23.2\,s against 17.6\,s),
+because the per-tree rounding pass and the $K$-wide integer loops cost more
+than the narrower histogram saves. Experimental.
+\item \emph{A lower leaf-size floor for regression}
+(\code{min\_samples\_leaf\_range}$=(3,60)$), suggested by the meta-tuned
+LightGBM defaults of \cite{holzmuller2024better}: better on California
+($-0.0015$) and Superconduct ($-0.16$), worse on Friedman1, and models
+1.2--1.4$\times$ larger. \emph{Longer early-stopping patience} (30): no
+accuracy change beyond $+0.0025$ AUC on Madelon, at longer fits. Both defaults
+stay.
+\item \emph{Honest leaf means} were not implemented: the evidence
+\cite{hou2025honesty,fang2025inference} is against replacing training means
+with holdout means for prediction, which is why the step-size form above was
+tried instead.
+\end{itemize}
 
 \section{Reproduction}\label{sec:repro}
 
@@ -1508,6 +1644,48 @@ A.~Agarwal, Y.~S. Tan, O.~Ronen, C.~Singh, and B.~Yu.
 \newblock Hierarchical shrinkage: Improving the accuracy and interpretability
 of tree-based methods.
 \newblock In \emph{ICML}, 2022.
+
+\bibitem{meinshausen2007relaxed}
+N.~Meinshausen.
+\newblock Relaxed lasso.
+\newblock \emph{Computational Statistics \& Data Analysis}, 52(1):374--393, 2007.
+
+\bibitem{painsky2019compression}
+A.~Painsky and S.~Rosset.
+\newblock Lossless compression of random forests.
+\newblock \emph{Journal of Computer Science and Technology}, 34:108--123, 2019.
+
+\bibitem{ponomareva2017compact}
+N.~Ponomareva, T.~Colthurst, G.~Hendry, S.~Haykal, and S.~Radpour.
+\newblock Compact multi-class boosted trees.
+\newblock In \emph{IEEE International Conference on Big Data}, 2017.
+
+\bibitem{park2018paloboost}
+Y.~Park and J.~C. Ho.
+\newblock {PaloBoost}: An overfitting-robust {TreeBoost} with out-of-bag sample
+regularization techniques.
+\newblock arXiv:1807.08383, 2018.
+
+\bibitem{shi2022quantized}
+Y.~Shi, G.~Ke, Z.~Chen, S.~Zheng, and T.-Y. Liu.
+\newblock Quantized training of gradient boosting decision trees.
+\newblock In \emph{NeurIPS}, 2022.
+
+\bibitem{holzmuller2024better}
+D.~Holzm\"uller, L.~Grinsztajn, and I.~Steinwart.
+\newblock Better by default: Strong pre-tuned {MLPs} and boosted trees on
+tabular data.
+\newblock In \emph{NeurIPS}, 2024.
+
+\bibitem{hou2025honesty}
+Y.~Hou and C.~Fern\'andez-Lor\'ia.
+\newblock Honesty in causal forests: When it helps and when it hurts.
+\newblock arXiv:2506.13107, 2025.
+
+\bibitem{fang2025inference}
+H.~Fang, K.~Tan, and G.~Hooker.
+\newblock Statistical inference for gradient boosting regression.
+\newblock In \emph{NeurIPS}, 2025.
 
 \bibitem{breiman1996oob}
 L.~Breiman.
@@ -1637,8 +1815,12 @@ Parameter & Default & Prototype & Meaning \\
 \code{max\_bins} & \code{255} & \code{n\_bins} & bins for finite values; a 256th holds missing \\
 \code{bundle\_binary\_features} & \code{False} & \code{bundle\_binary} & exclusive feature bundling for binary columns \\
 \code{hybrid\_min} & \code{600} & --- & node size above which subtraction is used (speed only) \\
+\code{leaf\_shrinkage} & \code{None} & \code{leaf\_shrink} & opt-in holdout-fitted leaf step size (Section~\ref{sec:litpass}) \\
+\code{hist\_bits} & \code{0} & \code{hist\_bits} & opt-in quantized histograms; 0 is exact (Section~\ref{sec:litpass}) \\
 \addlinespace
 \multicolumn{4}{l}{\emph{Weight fit and output}} \\
+\code{weight\_refit} & \code{"relaxed"} & --- & relaxed lasso: NNLS refit on the selected support, blend chosen by CV \\
+\code{multiclass} & \code{"vector"} & --- & $K$-vector leaves, or \code{"ovr"} for one ensemble per class \\
 \code{l1\_ratio} & \code{1.0} & \code{l1\_ratios} & \code{1.0} is a pure lasso \\
 \code{n\_alphas} & \code{20} & \code{n\_alphas} & regularisation path length \\
 \code{weight\_cv} & \code{3} & \code{cv} & folds for choosing $\alpha$ \\

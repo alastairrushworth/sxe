@@ -8,7 +8,9 @@ import warnings
 import numpy as np
 import sklearn
 from sklearn.base import BaseEstimator, ClassifierMixin, RegressorMixin
-from sklearn.linear_model import ElasticNet, ElasticNetCV, LogisticRegression
+from scipy.optimize import nnls
+from sklearn.linear_model import ElasticNet, ElasticNetCV, LogisticRegression, enet_path
+from sklearn.model_selection import KFold
 from sklearn.utils.multiclass import check_classification_targets
 from sklearn.utils.validation import check_is_fitted
 
@@ -155,6 +157,20 @@ class _BaseSXE(BaseEstimator):
         holdout, so rates near 1.0 leave little to prune against.
     prune_strength_range : tuple of float, default=(1e-3, 1.0)
         Per-tree holdout pruning penalty lambda, sampled log-uniformly.
+    leaf_shrinkage : float or None, default=None
+        Holdout-fitted step size per leaf. After pruning, each leaf's training
+        mean is multiplied by the factor that minimises that tree's holdout
+        error, ``c = (sum_h(r)/mu + leaf_shrinkage) / (n_h + leaf_shrinkage)``
+        clipped to [0, 1] -- so a leaf the holdout contradicts is damped and
+        one it confirms is kept whole. The value is the strength of the pull
+        toward 1 (in holdout rows); 0 is the raw holdout fit. None disables.
+    hist_bits : int, default=0
+        0 grows on exact residual histograms. A value in [2, 15] rounds each
+        row's residual stochastically to that many bits per tree and scores
+        splits from integer histograms (quantized training, Shi et al. 2022);
+        leaf values are still the exact means. Integer sums are cheaper to
+        build and order-independent. Experimental: measure before relying on
+        it.
     splitter : {"best", "random"}, default="best"
         "best" scans all bins for the optimal cut per candidate feature;
         "random" draws ``n_thresholds`` random cut-points instead, trading
@@ -163,6 +179,10 @@ class _BaseSXE(BaseEstimator):
         Random cut-points per candidate feature when splitter="random".
     bundle_binary_features : bool, default=False
         Enable exclusive feature bundling for binary columns.
+    multiclass : {"vector", "ovr"}, default="vector"
+        Classifier only; ignored for binary targets. "vector" grows one
+        ensemble with K-vector leaves (structure shared across classes);
+        "ovr" fits one binary ensemble per class.
     calibrate : {"sigmoid", None}, default="sigmoid"
         Classifier only; ignored by ``SXERegressor``. The ensemble fits
         squared error against 0/1 targets, so its raw output is a regression
@@ -186,6 +206,17 @@ class _BaseSXE(BaseEstimator):
         Folds for choosing the weight-fit alpha.
     l1_ratio : float or list of float, default=1.0
         Elastic-net mixing for the weight fit. 1.0 is a pure lasso.
+    weight_refit : {"relaxed", None}, default="relaxed"
+        "relaxed" fits a relaxed lasso (Meinshausen, 2007): the penalty
+        chooses which batches survive, and a non-negative least-squares refit
+        on those batches undoes the shrinkage the penalty put on their
+        weights. The penalty strength and the blend between the two solutions
+        are chosen together by cross-validation on the validation fold, so a
+        stronger penalty -- fewer batches, a smaller model -- can win when the
+        refit repairs what it cost. None keeps the plain lasso solution.
+        Measured across the benchmark suite, "relaxed" improved every
+        regression task and most classification tasks at equal or smaller
+        size, which is why it is the default.
     n_jobs : int or None, default=None
         Threads used for growth and prediction. ``None`` and ``-1`` both mean
         all available cores. Note this differs from the scikit-learn default
@@ -216,14 +247,18 @@ class _BaseSXE(BaseEstimator):
         max_features_range=(0.5, 1.0),
         subsample_range=(0.4, 0.75),
         prune_strength_range=(1e-3, 1.0),
+        leaf_shrinkage=None,
+        hist_bits=0,
         splitter="best",
         n_thresholds=2,
         bundle_binary_features=False,
         calibrate="sigmoid",
+        multiclass="vector",
         hybrid_min=600,
         n_alphas=20,
         weight_cv=3,
         l1_ratio=1.0,
+        weight_refit="relaxed",
         n_jobs=None,
         random_state=None,
         verbose=0,
@@ -241,14 +276,18 @@ class _BaseSXE(BaseEstimator):
         self.max_features_range = max_features_range
         self.subsample_range = subsample_range
         self.prune_strength_range = prune_strength_range
+        self.leaf_shrinkage = leaf_shrinkage
+        self.hist_bits = hist_bits
         self.splitter = splitter
         self.n_thresholds = n_thresholds
         self.bundle_binary_features = bundle_binary_features
         self.calibrate = calibrate
+        self.multiclass = multiclass
         self.hybrid_min = hybrid_min
         self.n_alphas = n_alphas
         self.weight_cv = weight_cv
         self.l1_ratio = l1_ratio
+        self.weight_refit = weight_refit
         self.n_jobs = n_jobs
         self.random_state = random_state
         self.verbose = verbose
@@ -291,6 +330,12 @@ class _BaseSXE(BaseEstimator):
             raise ValueError(f"max_leaf_nodes must be >= 2 or None, got {self.max_leaf_nodes}")
         if self.hybrid_min < 1:
             raise ValueError(f"hybrid_min must be >= 1, got {self.hybrid_min}")
+        if not (self.hist_bits == 0 or 2 <= int(self.hist_bits) <= 15):
+            raise ValueError(f"hist_bits must be 0 or in [2, 15], got {self.hist_bits}")
+        if self.weight_refit not in ("relaxed", None):
+            raise ValueError(f"weight_refit must be 'relaxed' or None, got {self.weight_refit!r}")
+        if self.leaf_shrinkage is not None and not self.leaf_shrinkage >= 0:
+            raise ValueError(f"leaf_shrinkage must be >= 0 or None, got {self.leaf_shrinkage}")
 
         depths = list(self.max_depth_choices)
         if not depths:
@@ -330,6 +375,9 @@ class _BaseSXE(BaseEstimator):
         n_val = P.shape[0]
         cv = int(min(self.weight_cv, n_val))
 
+        if self.weight_refit == "relaxed" and cv >= 2 and n_val >= 4 and len(l1_list) == 1:
+            return self._fit_weights_relaxed(P, y_val, l1_list[0], cv)
+
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             if cv >= 2 and n_val >= 4:
@@ -352,6 +400,66 @@ class _BaseSXE(BaseEstimator):
             if not np.any(w > 1e-10):
                 # the CV solution collapsed to the intercept; back off hard so
                 # the model is still an ensemble rather than a constant
+                en = ElasticNet(alpha=alpha * 1e-3, l1_ratio=1.0, positive=True, max_iter=6000)
+                en.fit(P, y_val)
+                w, b = en.coef_.copy(), float(en.intercept_)
+        return w, b
+
+    @staticmethod
+    def _nnls_refit(P, y, support):
+        """Non-negative least squares with a free intercept on the given columns."""
+        w = np.zeros(P.shape[1])
+        if support.size == 0:
+            return w, float(y.mean())
+        Ps = P[:, support]
+        pm, ym = Ps.mean(axis=0), float(y.mean())
+        coef, _ = nnls(Ps - pm, y - ym)
+        w[support] = coef
+        return w, ym - float(pm @ coef)
+
+    def _fit_weights_relaxed(self, P, y_val, l1, cv):
+        """Relaxed positive lasso: choose (alpha, blend) by CV over the fold.
+
+        For every alpha on the path the lasso picks a support; the refit is
+        NNLS on that support; the candidate solutions are the blends
+        ``phi * lasso + (1 - phi) * refit``. The pair minimising CV error is
+        refitted on the whole fold.
+        """
+        phis = np.array([1.0, 0.75, 0.5, 0.25, 0.0])
+        n_alphas = int(self.n_alphas)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            # enet_path works on centred data (no intercept); the alpha grid
+            # it derives from the whole fold is reused on every CV split.
+            alphas, _, _ = enet_path(
+                P - P.mean(axis=0), y_val - y_val.mean(), l1_ratio=l1,
+                n_alphas=n_alphas, positive=True,
+            )
+            folds = list(KFold(cv, shuffle=False).split(P))
+            err = np.zeros((len(alphas), len(phis)))
+            for tr, te in folds:
+                Ptr, ytr = P[tr], y_val[tr]
+                pm, ym = Ptr.mean(axis=0), ytr.mean()
+                _, coefs, _ = enet_path(
+                    Ptr - pm, ytr - ym, l1_ratio=l1, alphas=alphas, positive=True
+                )
+                for a in range(len(alphas)):
+                    w_l = coefs[:, a]
+                    b_l = ym - pm @ w_l
+                    w_r, b_r = self._nnls_refit(Ptr, ytr, np.flatnonzero(w_l > 1e-10))
+                    for k, phi in enumerate(phis):
+                        w = phi * w_l + (1.0 - phi) * w_r
+                        b = phi * b_l + (1.0 - phi) * b_r
+                        res = y_val[te] - (P[te] @ w + b)
+                        err[a, k] += float(res @ res)
+            a_best, k_best = np.unravel_index(np.argmin(err), err.shape)
+            alpha, phi = float(alphas[a_best]), float(phis[k_best])
+            en = ElasticNet(alpha=alpha, l1_ratio=l1, positive=True, max_iter=6000).fit(P, y_val)
+            w_l, b_l = en.coef_.copy(), float(en.intercept_)
+            w_r, b_r = self._nnls_refit(P, y_val, np.flatnonzero(w_l > 1e-10))
+            w = phi * w_l + (1.0 - phi) * w_r
+            b = phi * b_l + (1.0 - phi) * b_r
+            if not np.any(w > 1e-10):
                 en = ElasticNet(alpha=alpha * 1e-3, l1_ratio=1.0, positive=True, max_iter=6000)
                 en.fit(P, y_val)
                 w, b = en.coef_.copy(), float(en.intercept_)
@@ -390,7 +498,8 @@ class _BaseSXE(BaseEstimator):
         y_val = np.ascontiguousarray(y[val_idx])
 
         batch = int(self.batch_size)
-        var_val = float(np.var(y_val))
+        # a (n, K) target early-stops on the MSE summed over its K columns
+        var_val = float(np.var(y_val, axis=0).sum()) if y_val.ndim == 2 else float(np.var(y_val))
         ens = _core.Ensemble()
         t_grow = time.perf_counter()
         n_members, n_batches = ens.boost(
@@ -415,6 +524,8 @@ class _BaseSXE(BaseEstimator):
             feat_hi=feat[1],
             lam_lo=lam[0],
             lam_hi=lam[1],
+            leaf_shrink=-1.0 if self.leaf_shrinkage is None else float(self.leaf_shrinkage),
+            hist_bits=int(self.hist_bits),
             hybrid_min=int(self.hybrid_min),
             seed=int(rng.integers(2**63 - 1)),
             n_jobs=n_jobs,
@@ -425,8 +536,10 @@ class _BaseSXE(BaseEstimator):
         # becomes independent of the number of trees, and it can drop whole
         # steps of the boosting trajectory.
         t_w = time.perf_counter()
+        # For a K-column target the design matrix stacks the K outputs of
+        # every validation row -- one weight per batch, shared by all K.
         Pb = ens.predict_batch_means(Xval, batch, n_jobs)
-        w_batch, intercept = self._fit_weights(Pb, y_val)
+        w_batch, intercept = self._fit_weights(Pb, np.ascontiguousarray(y_val).ravel())
         sel_b = np.flatnonzero(w_batch > 1e-10)
         if sel_b.size == 0:  # degenerate: keep the first batch at zero weight
             sel_b = np.array([0], dtype=np.int64)
@@ -438,6 +551,10 @@ class _BaseSXE(BaseEstimator):
         # Physically drop the members that carry no weight. After this the
         # model object holds exactly the trees that contribute.
         self.ensemble_ = ens.subset(np.ascontiguousarray(sel, dtype=np.int32))
+        # Round leaves to the 16-bit codes the blob stores, before anything
+        # (the calibrator, the reported size) sees them: the model in memory
+        # is the model on disk.
+        self.ensemble_.quantize_leaves()
         self._members = np.arange(self.ensemble_.n_members, dtype=np.int32)
         self.weights_ = np.ascontiguousarray(weights, dtype=np.float64)
         self.intercept_ = float(intercept)
@@ -483,9 +600,21 @@ class _BaseSXE(BaseEstimator):
         plus the quantile edges that have to travel with it. Nothing here is an
         estimate of a format SXE does not implement.
         """
-        self.binner_.restrict(used)
         subs = getattr(self, "estimators_", None)
         trees = subs if subs else [self]
+        # Ship only the edges behind cuts some tree makes, and renumber the
+        # trees' thresholds to the compacted table. The union over sub-models
+        # matters: they share one table.
+        cuts = np.logical_or.reduce(
+            [
+                np.asarray(m.ensemble_.used_thresholds(m._members, len(used)), dtype=bool)
+                for m in trees
+            ]
+        )
+        cuts[~used] = False
+        table = self.binner_.restrict_thresholds(cuts)
+        for m in trees:
+            m.ensemble_.remap_thresholds(table)
         self.tree_bytes_ = int(sum(m.ensemble_.serialized_size() for m in trees))
         self.bin_table_bytes_ = int(sum(e.nbytes for e in self.binner_.edges_))
         self.model_size_bytes_ = self.tree_bytes_ + self.bin_table_bytes_
@@ -610,12 +739,20 @@ class _CalibratesBinary:
         s = self.ensemble_.predict_weighted(
             Xval, self._members, self.weights_, self.intercept_, n_jobs
         )
+        if s.ndim == 2:
+            # one sigmoid per class column; all or none, so the columns stay
+            # on one scale before they are normalised to a distribution
+            cals = [_fit_platt(s[:, k], y_val[:, k]) for k in range(s.shape[1])]
+            return cals if all(c is not None for c in cals) else None
         return _fit_platt(s, y_val)
 
     def _probability(self, scores):
-        """Map raw ensemble scores onto [0, 1]."""
-        if getattr(self, "calibrator_", None) is not None:
-            return _apply_platt(self.calibrator_, scores)
+        """Map raw ensemble scores onto [0, 1], column by column if 2-D."""
+        cal = getattr(self, "calibrator_", None)
+        if cal is not None:
+            if scores.ndim == 2:
+                return np.column_stack([_apply_platt(c, scores[:, k]) for k, c in enumerate(cal)])
+            return _apply_platt(cal, scores)
         # Uncalibrated fallback. Clipping is crude: it collapses both tails
         # into ties, which perturbs ranking metrics as well as log-loss.
         return np.clip(scores, 1e-6, 1 - 1e-6)
@@ -646,10 +783,12 @@ class SXEClassifier(ClassifierMixin, _CalibratesBinary, _BaseSXE):
     stacked-classifier reduction): leaf means are probability estimates, and
     MSE splits on 0/1 targets are equivalent to Gini up to constants.
 
-    Targets with more than two classes are fitted one-vs-rest -- one binary
-    ensemble per class, with the per-class scores normalised to sum to one.
-    That is a reduction, not a native multiclass loss: it costs one full
-    ensemble per class and does not share structure between them.
+    Targets with more than two classes are fitted by default as one ensemble
+    whose trees carry a K-vector leaf (``multiclass="vector"``): every split
+    is scored on the gain summed over the K one-hot residual columns, so the
+    tree structure is shared across classes and only the leaves are per
+    class. ``multiclass="ovr"`` keeps the older one-vs-rest reduction -- one
+    full binary ensemble per class -- which costs K times the structure.
 
     Examples
     --------
@@ -674,7 +813,12 @@ class SXEClassifier(ClassifierMixin, _CalibratesBinary, _BaseSXE):
             self.estimators_ = None
             self._fit(X, (y == classes[1]).astype(np.float64))
             self._compact(self.used_features_)
-        else:
+        elif self.multiclass == "vector":
+            self.estimators_ = None
+            Y = np.ascontiguousarray((y[:, None] == classes[None, :]).astype(np.float64))
+            self._fit(X, Y)
+            self._compact(self.used_features_)
+        elif self.multiclass == "ovr":
             params = self.get_params()
             estimators = []
             for c in classes:
@@ -684,6 +828,8 @@ class SXEClassifier(ClassifierMixin, _CalibratesBinary, _BaseSXE):
                 estimators.append(sub)
             self.estimators_ = estimators
             self._aggregate_multiclass()
+        else:
+            raise ValueError(f"multiclass must be 'vector' or 'ovr', got {self.multiclass!r}")
         self.classes_ = classes
         return self._report()
 
@@ -725,6 +871,11 @@ class SXEClassifier(ClassifierMixin, _CalibratesBinary, _BaseSXE):
         X = _validate(self, X, reset=False, dtype=np.float64, ensure_2d=True)
         if self.estimators_ is None:
             p = self._probability(self._score_validated(X))
+            if p.ndim == 2:  # vector-leaf multiclass: K calibrated columns
+                total = p.sum(axis=1, keepdims=True)
+                return np.divide(
+                    p, total, out=np.full_like(p, 1.0 / p.shape[1]), where=total > 0
+                )
             return np.column_stack([1.0 - p, p])
         # one-vs-rest: each sub-model maps its own score onto [0, 1] with its
         # own calibration, then the columns are normalised to a distribution
@@ -742,7 +893,7 @@ class SXEClassifier(ClassifierMixin, _CalibratesBinary, _BaseSXE):
         # and predict_proba consistent: calibration moves the raw score that
         # corresponds to p = 0.5 away from 0.5.
         p = self._class_scores(X)
-        if self.estimators_ is None:
+        if len(self.classes_) == 2:
             # threshold rather than argmax, so p == 0.5 resolves to the
             # positive class as it does elsewhere in the binary reduction
             return self.classes_[(p[:, 1] >= 0.5).astype(int)]

@@ -141,8 +141,14 @@ def test_multiclass_calibration_is_all_or_nothing():
         weights=[0.94, 0.03, 0.02, 0.01],
         random_state=3,
     )
-    m = SXEClassifier(random_state=0, max_iter=10, batch_size=4).fit(X, y)
+    m = SXEClassifier(random_state=0, max_iter=10, batch_size=4, multiclass="ovr").fit(X, y)
     fitted = [s.calibrator_ is not None for s in m.estimators_]
     assert all(fitted) or not any(fitted)
     p = m.predict_proba(X)
+    assert np.allclose(p.sum(axis=1), 1.0)
+
+    # the vector-leaf path calibrates its K columns on the same rule
+    v = SXEClassifier(random_state=0, max_iter=10, batch_size=4).fit(X, y)
+    assert v.calibrator_ is None or len(v.calibrator_) == 4
+    p = v.predict_proba(X)
     assert np.allclose(p.sum(axis=1), 1.0)

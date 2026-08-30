@@ -140,17 +140,27 @@ def test_importances_survive_a_round_trip(fitted_reg):
 
 
 def test_pruned_bin_table_does_not_change_predictions(fitted_reg):
-    """Unused columns transform to bin 0 instead of their true bin. That is
-    only safe if no tree indexes them, so check it against a full binner."""
+    """Compaction drops unused columns *and* unused edges, renumbering the
+    trees' thresholds to match. It must be invisible to predict()."""
     from sxe.binning import QuantileBinner
+    from sxe.estimator import _BaseSXE
 
     model, X = fitted_reg
-    before = model.predict(X)
-    assert model.bin_table_bytes_ <= sum(
-        e.nbytes for e in QuantileBinner(model.max_bins, random_state=0).fit(X).edges_
-    )
-    model.binner_ = QuantileBinner(model.max_bins, random_state=0).fit(X)
-    assert np.array_equal(before, model.predict(X))
+    full = sum(e.nbytes for e in QuantileBinner(model.max_bins, random_state=0).fit(X).edges_)
+    assert model.bin_table_bytes_ < full
+
+    _, y = make_regression(n_samples=800, n_features=8, noise=1.0, random_state=0)
+    raw = SXERegressor(**model.get_params())
+    compact = _BaseSXE._compact
+    _BaseSXE._compact = lambda self, used: None  # fit without compaction
+    try:
+        raw.fit(X, y)
+    finally:
+        _BaseSXE._compact = compact
+    before = raw.predict(X)
+    compact(raw, raw.used_features_)
+    assert np.array_equal(before, raw.predict(X))
+    assert raw.bin_table_bytes_ == sum(e.nbytes for e in raw.binner_.edges_)
 
 
 def test_multiclass_shares_one_bin_table():
@@ -177,6 +187,7 @@ def test_multiclass_shares_one_bin_table():
         batch_size=4,
         max_depth_choices=(3,),
         max_features_range=(0.1, 0.2),
+        multiclass="ovr",
     )
     model = SXEClassifier(**cfg).fit(X, y)
     per_class = [s.used_features_ for s in model.estimators_]
@@ -188,7 +199,51 @@ def test_multiclass_shares_one_bin_table():
     assert not (union & ~carried).any(), "a class splits on a column with no edges"
     assert model.bin_table_bytes_ == sum(e.nbytes for e in model.binner_.edges_)
 
-    reference = SXEClassifier(**cfg).fit(X, y)
-    for sub in reference.estimators_:
-        sub.binner_ = QuantileBinner(reference.max_bins, random_state=0).fit(X)
+    from sxe.estimator import _BaseSXE
+
+    compact = _BaseSXE._compact
+    _BaseSXE._compact = lambda self, used: None  # fit without compaction
+    try:
+        reference = SXEClassifier(**cfg).fit(X, y)
+    finally:
+        _BaseSXE._compact = compact
     assert np.array_equal(model.predict_proba(X), reference.predict_proba(X))
+
+
+def test_restrict_thresholds_renumbers_cuts_consistently():
+    """A cut ``bin <= t`` is ``x < edges[t]``; after compaction the same edge
+    sits at a new index and the remap table must point at it. Cuts at or
+    beyond the last edge separate missing from finite and need no edge."""
+    from sxe.binning import MISSING_BIN, QuantileBinner
+
+    rng = np.random.default_rng(0)
+    X = rng.standard_normal((2000, 2))
+    X[rng.random(2000) < 0.1, 1] = np.nan
+    b = QuantileBinner(64, random_state=0).fit(X)
+    k0, k1 = len(b.edges_[0]), len(b.edges_[1])
+    old = b.transform(X)
+
+    used = np.zeros((2, 256), dtype=bool)
+    used[0, [3, 17, k0 - 1]] = True
+    used[1, [5, k1]] = True  # k1: the finite-vs-missing cut
+    table = b.restrict_thresholds(used)
+    new = b.transform(X)
+
+    for f, ts in ((0, [3, 17, k0 - 1]), (1, [5, k1])):
+        for t in ts:
+            assert np.array_equal(old[:, f] <= t, new[:, f] <= table[f, t])
+    assert len(b.edges_[0]) == 3 and len(b.edges_[1]) == 1
+    assert (new[np.isnan(X[:, 1]), 1] == MISSING_BIN).all()
+
+
+def test_leaf_codes_are_applied_in_memory(fitted_reg):
+    """Every leaf must be exactly representable by the 16-bit code the blob
+    stores, so pickling changes nothing -- and the rounding is tiny."""
+    model, X = fitted_reg
+    from sxe._core import Ensemble
+
+    restored = Ensemble.deserialize(model.ensemble_.serialize())
+    members = np.arange(model.ensemble_.n_members, dtype=np.int32)
+    a = model.ensemble_.predict_members(np.asfortranarray(model.binner_.transform(X)), members)
+    b = restored.predict_members(np.asfortranarray(model.binner_.transform(X)), members)
+    assert np.array_equal(a, b)

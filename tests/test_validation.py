@@ -50,7 +50,7 @@ def test_multiclass_target_is_supported():
         n_samples=600, n_features=8, n_informative=5, n_classes=3, random_state=0
     )
     model = SXEClassifier(random_state=0, **CFG).fit(X, y)
-    assert len(model.estimators_) == 3
+    assert model.ensemble_.n_out == 3
     assert set(np.unique(model.predict(X))) <= {0, 1, 2}
 
 
@@ -146,3 +146,39 @@ def test_bundler_rejects_predict_time_conflicts():
     assert np.array_equal(b.transform(train).ravel(), [1, 2, 3, 1])
     with pytest.raises(ValueError, match="mutually exclusive"):
         b.transform(np.array([[1, 1, 0]], dtype=float))
+
+
+def test_leaf_shrinkage_and_weight_refit_are_validated():
+    from sklearn.datasets import make_regression
+
+    from sxe import SXERegressor
+
+    X, y = make_regression(n_samples=300, n_features=6, random_state=0)
+    with pytest.raises(ValueError, match="leaf_shrinkage"):
+        SXERegressor(leaf_shrinkage=-1.0).fit(X, y)
+    with pytest.raises(ValueError, match="weight_refit"):
+        SXERegressor(weight_refit="nnls").fit(X, y)
+
+
+def test_leaf_shrinkage_never_amplifies_a_leaf():
+    """Every leaf is the training mean times a factor in [0, 1], so the
+    shrunk ensemble's member predictions are bounded by the unshrunk one's."""
+    from sklearn.datasets import make_regression
+
+    from sxe import SXERegressor
+
+    X, y = make_regression(n_samples=1500, n_features=6, noise=5.0, random_state=0)
+    # one batch: the trees are grown on the same residual either way, so
+    # they differ only in their leaf values
+    cfg = dict(random_state=0, max_iter=1, batch_size=8)
+    raw = SXERegressor(**cfg).fit(X, y)
+    shrunk = SXERegressor(leaf_shrinkage=0.0, **cfg).fit(X, y)
+    Xb = np.asfortranarray(raw.binner_.transform(X))
+    Xs = np.asfortranarray(shrunk.binner_.transform(X))
+    members = np.arange(raw.ensemble_.n_members, dtype=np.int32)
+    a = np.abs(raw.ensemble_.predict_members(Xb, members))
+    b = np.abs(shrunk.ensemble_.predict_members(Xs, members))
+    # tolerance: one 16-bit leaf-code step on this target's range
+    step = np.ptp(y) / 65535.0
+    assert (b <= a + step).all()
+    assert (b < a - step).any()

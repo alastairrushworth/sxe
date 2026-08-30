@@ -97,6 +97,8 @@ by accident:
   is worth replacing the C++ standard library's random distributions to get.
 - Whether the squared-error loss stays, or second-order/Newton leaf values are worth
   the complexity to close the accuracy gap on smooth signal.
-- Whether multiclass stays a one-vs-rest reduction or becomes a native objective.
+- Multiclass now shares one tree structure across classes (K-vector leaves,
+  squared error on one-hot targets); whether a multinomial loss is worth adding on
+  top of that is still open.
 - Whether SXE should ever add a tuning helper, or whether shipping one would be an
   admission that goal 2 has failed.

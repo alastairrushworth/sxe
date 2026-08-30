@@ -11,6 +11,11 @@ Missing values get the top bin. Finite values occupy 0..254 and NaN occupies
 like any other, so missing always travels with the largest values *unless* a
 split at 254 separates it, and the exact-cut scan will find that split when it
 pays. Nothing is imputed and nothing is guessed.
+
+Edges are float32, rounded *before* the training data is binned, so the table
+that ships is the table the trees were grown against. After a fit the table is
+compacted to the edges some tree actually cuts at (``restrict_thresholds``);
+the trees' bin thresholds are renumbered to match.
 """
 
 from __future__ import annotations
@@ -24,6 +29,7 @@ __all__ = ["QuantileBinner"]
 # 256th is reserved for missing.
 MAX_BINS = 255
 MISSING_BIN = 255
+N_THRESHOLDS = 256  # a split threshold is any uint8 bin id
 
 
 class QuantileBinner:
@@ -70,8 +76,11 @@ class QuantileBinner:
     def _column_edges(col, qs):
         col = col[np.isfinite(col)]
         if col.size == 0:  # an all-missing column: every row lands in MISSING_BIN
-            return np.empty(0, dtype=np.float64)
-        return np.unique(np.quantile(col, qs))
+            return np.empty(0, dtype=np.float32)
+        # Rounded to float32 here, not at save time: binning the training data
+        # with edges the model does not ship would make the trees on disk
+        # subtly different from the trees that were grown.
+        return np.unique(np.quantile(col, qs).astype(np.float32))
 
     def transform(self, X) -> np.ndarray:
         if not hasattr(self, "edges_"):
@@ -117,9 +126,46 @@ class QuantileBinner:
                 f"used must be a boolean mask over {self.n_features_in_} features, "
                 f"got shape {used.shape}"
             )
-        empty = np.empty(0, dtype=np.float64)
+        empty = np.empty(0, dtype=np.float32)
         self.edges_ = [e if u else empty for e, u in zip(self.edges_, used)]
         return self
+
+    def restrict_thresholds(self, used) -> np.ndarray:
+        """Keep only the edges behind cuts a model uses; return the bin remap.
+
+        ``used`` is a boolean ``(n_features, 256)`` mask: ``used[f, t]`` says
+        some tree splits feature ``f`` at ``bin <= t``. Because ``transform``
+        assigns ``bin = #(edges <= x)``, that cut is ``x < edges[t]`` and needs
+        exactly one edge. A cut at ``t >= len(edges)`` separates missing (bin
+        255) from every finite value and needs none.
+
+        Returns a ``(n_features, 256)`` uint8 table mapping each old threshold
+        to its id under the compacted edges, for the trees to apply. Columns
+        with no used cut keep no edges and transform to bin 0, which is safe
+        for the same reason as in ``restrict``: nothing reads them.
+        """
+        if not hasattr(self, "edges_"):
+            raise ValueError("QuantileBinner is not fitted yet; call fit() first")
+        used = np.asarray(used, dtype=bool)
+        if used.shape != (self.n_features_in_, N_THRESHOLDS):
+            raise ValueError(
+                f"used must be a boolean mask of shape {(self.n_features_in_, N_THRESHOLDS)}, "
+                f"got shape {used.shape}"
+            )
+        table = np.zeros((self.n_features_in_, N_THRESHOLDS), dtype=np.uint8)
+        new_edges = []
+        for f, e in enumerate(self.edges_):
+            k = len(e)
+            keep = np.flatnonzero(used[f, :k])
+            new_edges.append(e[keep])
+            # old threshold t < k -> its rank among the kept edges; t >= k -> the
+            # count of kept edges (finite-vs-missing cut). Unused t < k also get
+            # a consistent id, though no tree will ask for one.
+            ranks = np.searchsorted(keep, np.arange(k), side="left")
+            table[f, :k] = ranks
+            table[f, k:] = len(keep)
+        self.edges_ = new_edges
+        return table
 
     def fit_transform(self, X) -> np.ndarray:
         return self.fit(X).transform(X)
