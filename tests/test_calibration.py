@@ -91,11 +91,18 @@ def test_predict_agrees_with_predict_proba(data):
 
 
 def test_calibrate_none_restores_the_clip(data):
+    """Under the squared-error reduction the raw score is clipped; under the
+    logistic loss it is a logit and the sigmoid is the uncalibrated map."""
     Xtr, Xte, ytr, _ = data
-    m = SXEClassifier(calibrate=None, **CFG).fit(Xtr, ytr)
+    m = SXEClassifier(calibrate=None, loss="squared", **CFG).fit(Xtr, ytr)
     assert m.calibrator_ is None
     raw = m._score_validated(np.asarray(Xte, dtype=np.float64))
     assert np.array_equal(m.predict_proba(Xte)[:, 1], np.clip(raw, 1e-6, 1 - 1e-6))
+
+    m = SXEClassifier(calibrate=None, loss="logistic", **CFG).fit(Xtr, ytr)
+    assert m.calibrator_ is None
+    raw = m._score_validated(np.asarray(Xte, dtype=np.float64))
+    assert np.allclose(m.predict_proba(Xte)[:, 1], 1.0 / (1.0 + np.exp(-raw)))
 
 
 def test_unknown_calibrate_value_is_rejected(data):
@@ -147,8 +154,14 @@ def test_multiclass_calibration_is_all_or_nothing():
     p = m.predict_proba(X)
     assert np.allclose(p.sum(axis=1), 1.0)
 
-    # the vector-leaf path calibrates its K columns on the same rule
-    v = SXEClassifier(random_state=0, max_iter=10, batch_size=4).fit(X, y)
+    # the vector-leaf squared path calibrates its K columns on the same rule
+    v = SXEClassifier(random_state=0, max_iter=10, batch_size=4, loss="squared").fit(X, y)
     assert v.calibrator_ is None or len(v.calibrator_) == 4
     p = v.predict_proba(X)
+    assert np.allclose(p.sum(axis=1), 1.0)
+
+    # the logistic path fits one softmax temperature over all K logits
+    lg = SXEClassifier(random_state=0, max_iter=10, batch_size=4).fit(X, y)
+    assert lg.calibrator_[0] == "softmax" and lg.calibrator_[1] > 0
+    p = lg.predict_proba(X)
     assert np.allclose(p.sum(axis=1), 1.0)

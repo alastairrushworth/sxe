@@ -423,6 +423,18 @@ averages over the draw.
 
 \subsection{Holdout reduced-error pruning}\label{sec:pruning}
 
+\paragraph{Where the holdout comes from.} By default (\code{holdout="batch"})
+every batch partitions the training rows into $F = 4$ folds afresh; tree $t$
+grows on every fold but fold $t \bmod F$ and prunes on that fold. Each tree
+therefore sees $3/4$ of the rows, each row is a holdout row for $B/F$ of the
+batch's trees, and the holdout is never near-empty. The older design
+(\code{holdout="random"}) draws a per-tree subsample at a rate from
+\code{subsample\_range} and prunes on its complement. The out-of-batch design
+was adopted because giving every tree more of the data was the one lever that
+moved the smooth regression datasets (Section~\ref{sec:accpass}); it also gives
+every training row an honest out-of-batch prediction, which the weight fit of
+Section~\ref{sec:weights} uses.
+
 Each tree is grown on a subsample of rate drawn in $[0.4, 0.75]$ by default, so
 25--60\% of the rows are \emph{not} used to grow it. These are that tree's
 private holdout, and they are free --- the out-of-bag idea \cite{breiman1996oob}
@@ -568,6 +580,16 @@ datasets at three seeds (Section~\ref{sec:inflight}) the relaxed fit improved
 every regression task and most classification tasks at equal or smaller size;
 \code{weight\_refit=None} restores the plain lasso.
 
+\paragraph{Which rows.} Under out-of-batch holdouts the design matrix is not
+the validation fold alone: for a bounded subset of training rows (up to
+$200{,}000/K$) the core also returns, per batch, the mean prediction of the
+trees that held the row out --- honest, because none of those trees saw the
+row --- and the relaxed fit runs on those rows stacked with the fold. Among
+the $(\alpha, \phi)$ pairs whose cross-validated error is within
+\code{weight\_tol} ($=1\%$) of the best, the sparsest is taken: a relative
+tolerance rather than a standard-error rule, so it means the same thing on a
+3k-row fold and on 200k out-of-batch rows.
+
 Four design choices deserve justification.
 
 \paragraph{Why a lasso at all.} By the stagewise--lasso correspondence
@@ -638,9 +660,19 @@ course and the lasso then discards 92\% of what it built.
 Prediction routes binned rows through the retained trees and forms
 $\beta_0 + \sum_j w_j T_j(x)$, parallelised over rows.
 
-Binary classification predicts the same raw score. Because the score is a
-weighted combination of 0/1 leaf means it is approximately a probability but
-not a calibrated one, so \SXE\ fits a Platt sigmoid \cite{platt1999} on the
+Classification (\code{loss="logistic"}, the default) grows each tree on the
+gradient $y - p$ of the log-likelihood at the current logit $F$, takes Newton
+leaf values $\sum (y-p) / (\sum p(1-p) + \lambda)$ over the training rows a
+leaf holds (grown leaves feed their collapsed ancestor, so pruning --- decided
+on squared error of the gradient --- is untouched), early-stops on validation
+deviance, and fits the batch weights on the Newton working response
+$z = F + (y-p)/(p(1-p))$ with weights $p(1-p)$ --- one iteratively-reweighted
+step of the deviance around the generation ensemble's logit. For $K > 2$
+classes the logit is a $K$-vector leaf under a softmax, and a single
+temperature fitted on the fold maps the ensemble's logits to probabilities.
+The older reduction (\code{loss="squared"}) predicts a raw score that is a
+weighted combination of 0/1 leaf means --- approximately a probability but not
+a calibrated one --- so \SXE\ fits a Platt sigmoid \cite{platt1999} on the
 validation fold: $p = \sigma(a\,s + b)$ by maximum likelihood against Platt's
 smoothed targets $(N_+{+}1)/(N_+{+}2)$ and $1/(N_-{+}2)$, which keep the
 optimum finite when the fold happens to be separable. The smoothing is applied
@@ -1563,6 +1595,66 @@ with holdout means for prediction, which is why the step-size form above was
 tried instead.
 \end{itemize}
 
+\subsection{An accuracy pass}\label{sec:accpass}
+
+A third set of changes followed a diagnosis of where the tuned \SXE\ was
+losing. Twelve single-variable experiments at the defaults ruled out the
+validation fold, batch averaging (one tree per step is worse everywhere),
+the candidate-feature fraction, leaf $L_2$, the learning rate, the lasso
+(uniform weights are worse on Superconduct) and exact cut-points
+(randomised cuts win). What remained was the loss function on every
+classification dataset --- a plain gradient-boosting control lost 0.003--0.005
+AUC on Adult from fitting squared error to 0/1 targets --- the tree size at
+defaults on large $n$, and the fraction of the data each tree sees. The
+changes, each measured before adoption:
+
+\begin{itemize}[leftmargin=1.5em,itemsep=2pt]
+\item \emph{Logistic and multinomial loss with Newton leaves}
+(Section~\ref{sec:predict}). On the tuned configurations, before any other
+change: Covertype-full $0.9963 \to 0.9974$ AUC (LightGBM $0.9977$) with
+deviance $0.090 \to 0.065$; Letter $0.9623 \to 0.9667$ accuracy (LightGBM
+$0.9661$) at $3.4$\,MB against $5.6$; Adult $+0.002$, Bank $+0.002$ to
+$+0.003$ (now above LightGBM), Covertype-30k $+0.001$ to $+0.003$, Madelon
+flat; three seeds. A first version fitted the batch weights by least squares
+on the 0/1 targets and \emph{lost} AUC, which is why the working-response fit
+exists.
+\item \emph{Out-of-batch holdouts} (Section~\ref{sec:pruning}) and
+\emph{selection on the out-of-batch rows} (Section~\ref{sec:weights}). At
+defaults, with the other changes: California $0.461 \to 0.446$--$0.453$,
+Superconduct $10.17 \to 9.95$, Covertype-30k $0.936 \to 0.949$, Bank
+$+0.003$, Adult $+0.001$; Madelon $-0.004$. Four folds beat eight on the
+classification sets on both accuracy and size.
+\item \emph{Tree size and trajectory length set from $n$}
+(\code{max\_depth\_choices}, \code{min\_samples\_leaf\_range} and
+\code{max\_iter} default to \code{None}): deeper trees, smaller leaves and
+longer trajectories above 20k and 100k training rows, where the tuning gap
+had been concentrated.
+\item \emph{A wider tuned search}: batch caps raised (400/250/200 to
+1500/600/600), learning rates down to $0.01$, leaf budgets to 511, a leaf
+floor of 3, and the holdout design in the space. At the old caps a
+configuration outside the space reached $0.4362$ on California against the
+tuned $0.4421$ (LightGBM $0.4309$) at a seventh of LightGBM's size.
+\end{itemize}
+
+\paragraph{The price, stated plainly.} Trees that see more rows, Newton
+leaves and a weight fit with less selection noise all keep more structure:
+default models are 3--6$\times$ larger than before this pass (Adult
+77\,kB $\to$ 320\,kB, Covertype-30k 0.2 $\to$ 1.2\,MB) and default fits take
+2--6$\times$ longer. The size still sits below the tuned LightGBM on most
+datasets, but the 5--40$\times$ margins of Section~\ref{sec:litpass} are now
+1--7$\times$. \code{weight\_tol} and \code{holdout\_folds} are the dials that
+trade it back, and the measurements above are the evidence for where they
+were set.
+
+\paragraph{Tried and left opt-in.} \emph{Linear leaves}
+(\code{linear\_leaves}): a ridge model in the bin ids of the path features,
+fitted per exported leaf. With the usual tree depth it added 2--3$\times$ to
+the model for $-0.003$ RMSE on California and nothing on Superconduct; with
+shallow trees, which is where a linear leaf should pay, it was worse than
+deep constant leaves ($0.470$ against $0.447$; $11.2$ against $10.1$). The
+quantile-rank transform inside a small leaf is not a good linear regressor.
+\emph{Leaf $L_2$} (\code{leaf\_l2}): no effect at any strength.
+
 \section{Reproduction}\label{sec:repro}
 
 \begin{lstlisting}[language=bash]
@@ -1794,18 +1886,18 @@ Parameter & Default & Prototype & Meaning \\
 \midrule
 \multicolumn{4}{l}{\emph{Boosting trajectory}} \\
 \code{learning\_rate} & \code{0.07}$^\dagger$ \small[0.15] & \code{shrink} & $\nu$, shrinkage on each batch-average correction \\
-\code{max\_iter} & \code{300}$^\dagger$ \small[120] & \code{max\_batches} & maximum boosting batches \\
+\code{max\_iter} & \code{None} $\Rightarrow$ 600 / 300 by $n$ & \code{max\_batches} & maximum boosting batches \\
 \code{batch\_size} & \code{16}$^\dagger$ \small[10] & \code{batch} & trees grown in parallel per batch \\
 \code{n\_iter\_no\_change} & \code{15}$^\dagger$ \small[8] & \code{patience} & early-stopping patience, in batches \\
 \code{tol} & \code{1e-4} & --- & improvement threshold, in units of $\Var(y_{\text{val}})$ \\
 \code{validation\_fraction} & \code{0.18} & \code{val\_fraction} & fold for early stopping, weights and calibration \\
 \addlinespace
 \multicolumn{4}{l}{\emph{Per-tree randomization}} \\
-\code{max\_depth\_choices} & \code{(6,8,10,12)}$^\dagger$ & \code{depth\_choices} & depth sampled uniformly; \code{0} $\Rightarrow$ 64 \\
+\code{max\_depth\_choices} & \code{None} $\Rightarrow$ by $n$ & \code{depth\_choices} & depth sampled uniformly; \code{0} $\Rightarrow$ 64 \\
 & \small[(4,5,6,7,8)] & & \\
-\code{min\_samples\_leaf\_range} & \code{(10, 60)} & \code{leaf\_range} & log-uniform per tree \\
+\code{min\_samples\_leaf\_range} & \code{None} $\Rightarrow$ by $n$ & \code{leaf\_range} & log-uniform per tree \\
 \code{max\_features\_range} & \code{(0.5, 1.0)} & \code{feat\_range} & candidate-feature fraction, uniform per tree \\
-\code{subsample\_range} & \code{(0.4, 0.75)} & --- & row subsample; complement is the pruning holdout \\
+\code{subsample\_range} & \code{(0.4, 0.75)} & --- & row subsample under \code{holdout="random"}; complement is the pruning holdout \\
 \code{prune\_strength\_range} & \code{(1e-3, 1.0)} & \code{lam\_range} & $\lambda$, log-uniform per tree \\
 \addlinespace
 \multicolumn{4}{l}{\emph{Tree construction}} \\
@@ -1815,11 +1907,17 @@ Parameter & Default & Prototype & Meaning \\
 \code{max\_bins} & \code{255} & \code{n\_bins} & bins for finite values; a 256th holds missing \\
 \code{bundle\_binary\_features} & \code{False} & \code{bundle\_binary} & exclusive feature bundling for binary columns \\
 \code{hybrid\_min} & \code{600} & --- & node size above which subtraction is used (speed only) \\
+\code{holdout} & \code{"batch"} & \code{holdout\_folds} & out-of-batch folds, or \code{"random"} per-tree subsamples \\
+\code{holdout\_folds} & \code{4} & \code{holdout\_folds} & folds per batch; each tree sees $(F-1)/F$ of the rows \\
 \code{leaf\_shrinkage} & \code{None} & \code{leaf\_shrink} & opt-in holdout-fitted leaf step size (Section~\ref{sec:litpass}) \\
+\code{linear\_leaves} & \code{0} & \code{linear\_feats} & opt-in ridge leaves on bin ids (Section~\ref{sec:accpass}) \\
+\code{leaf\_l2} & \code{0} & \code{leaf\_l2} & opt-in $L_2$ on leaf values \\
 \code{hist\_bits} & \code{0} & \code{hist\_bits} & opt-in quantized histograms; 0 is exact (Section~\ref{sec:litpass}) \\
 \addlinespace
 \multicolumn{4}{l}{\emph{Weight fit and output}} \\
 \code{weight\_refit} & \code{"relaxed"} & --- & relaxed lasso: NNLS refit on the selected support, blend chosen by CV \\
+\code{weight\_tol} & \code{0.01} & --- & sparsest solution within this fraction of the best CV error \\
+\code{loss} & \code{"logistic"} & \code{loss} & logistic / multinomial with Newton leaves, or \code{"squared"} \\
 \code{multiclass} & \code{"vector"} & --- & $K$-vector leaves, or \code{"ovr"} for one ensemble per class \\
 \code{l1\_ratio} & \code{1.0} & \code{l1\_ratios} & \code{1.0} is a pure lasso \\
 \code{n\_alphas} & \code{20} & \code{n\_alphas} & regularisation path length \\

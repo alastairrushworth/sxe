@@ -79,8 +79,9 @@ source alongside it).
 - No `sample_weight`.
 - Multiclass shares one tree structure across classes (K-vector leaves) but still
   minimises squared error on one-hot targets, not a multinomial loss.
-- Regression and classification both minimise squared error. There is no
-  logistic loss and no second-order (Newton) leaf values yet.
+- Regression minimises squared error; classification now uses the logistic
+  (multinomial) loss with Newton leaf values, but there is no Huber, quantile or
+  Poisson objective.
 - **The defaults give up more to tuning than LightGBM's do** — a median 9.5% error
   reduction against 3.3%, on eight of nine datasets. Budget for a search, or wait
   for better defaults; see [Tuning](#tuning).
@@ -115,14 +116,19 @@ translation. The genuinely SXE-specific ones are:
 | Parameter | Default | Meaning |
 |---|---|---|
 | `batch_size` | `16` | Trees grown in parallel per boosting step. `1` recovers ordinary stochastic gradient boosting; one huge batch recovers a random forest. |
-| `subsample_range` | `(0.4, 0.75)` | Per-tree row subsample rate. The complement is that tree's pruning holdout, so rates near `1.0` leave little to prune against. |
+| `holdout` | `"batch"` | Every batch partitions the rows into `holdout_folds` folds; tree *t* grows on all but fold *t mod F* and prunes on it, so each tree sees 3/4 of the data and every row gets an honest out-of-batch prediction the weight fit uses. `"random"` is the older per-tree subsample. |
+| `holdout_folds` | `4` | Folds per batch under `holdout="batch"`. |
+| `subsample_range` | `(0.4, 0.75)` | Per-tree row subsample rate under `holdout="random"`; the complement is that tree's pruning holdout. |
 | `prune_strength_range` | `(1e-3, 1.0)` | Per-tree holdout pruning penalty λ, sampled log-uniformly. Small λ removes only splits that do not help held-out data. |
-| `max_depth_choices` | `(6, 8, 10, 12)` | Per-tree depth, sampled uniformly. `0` means unlimited. |
-| `min_samples_leaf_range` | `(10, 60)` | Sampled log-uniformly per tree. |
+| `max_depth_choices` | `None` | Per-tree depth, sampled uniformly; `0` means unlimited. `None` sizes trees to the data: `(6, 8, 10, 12)` below 20k training rows, `(8, 10, 12, 14)` to 100k, `(10, 12, 14)` above. |
+| `min_samples_leaf_range` | `None` | Sampled log-uniformly per tree. `None` follows the same size rule: `(10, 60)`, `(5, 30)`, `(2, 15)`. |
 | `max_features_range` | `(0.5, 1.0)` | Candidate-feature fraction, sampled uniformly per tree. |
 | `splitter` | `"best"` | `"best"` scans all bins for the optimal cut; `"random"` draws `n_thresholds` random cut-points, trading split quality for member diversity. |
 | `bundle_binary_features` | `False` | Exclusive feature bundling for binary columns. Worth enabling on wide one-hot data. |
 | `weight_refit` | `"relaxed"` | Relaxed lasso for the batch weights: the penalty picks the batches, a non-negative least-squares refit undoes its shrinkage, and the two are traded off by cross-validation. `None` keeps the plain lasso. |
+| `weight_tol` | `0.01` | Size preference in that fit: the sparsest solution within this fraction of the best cross-validated error. |
+| `loss` | `"logistic"` | Classifier only. Trees grow on the log-likelihood gradient with Newton leaf values, softmax for K > 2; `"squared"` is the older 0/1 regression reduction. |
+| `linear_leaves` | `0` | Regressor only, opt-in: ridge models in the bin ids of up to this many path features per leaf. Measured not to help at any tree depth tried — kept for experiment. |
 | `multiclass` | `"vector"` | `"vector"` grows one ensemble whose leaves hold a K-vector, so the tree structure is shared across classes; `"ovr"` fits one binary ensemble per class. |
 | `leaf_shrinkage` | `None` | Opt-in holdout-fitted step size per leaf (PaloBoost). Measured: small AUC gains on classification, slightly worse regression — hence off. |
 | `hist_bits` | `0` | Opt-in quantized training: residuals rounded stochastically to this many bits per tree, splits scored from integer histograms, leaf values exact. |

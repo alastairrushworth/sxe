@@ -8,7 +8,7 @@ import warnings
 import numpy as np
 import sklearn
 from sklearn.base import BaseEstimator, ClassifierMixin, RegressorMixin
-from scipy.optimize import nnls
+from scipy.optimize import minimize_scalar, nnls
 from sklearn.linear_model import ElasticNet, ElasticNetCV, LogisticRegression, enet_path
 from sklearn.model_selection import KFold
 from sklearn.utils.multiclass import check_classification_targets
@@ -128,7 +128,9 @@ class _BaseSXE(BaseEstimator):
     ----------
     learning_rate : float, default=0.07
         Shrinkage applied to each batch-average correction (nu).
-    max_iter : int, default=300
+    max_iter : int or None, default=None
+        Maximum number of boosting batches. None picks 600 below 100k
+        training rows and 300 above; early stopping usually fires first.
         Maximum number of boosting batches.
     batch_size : int, default=16
         Trees grown in parallel per batch. batch_size=1 recovers ordinary
@@ -144,17 +146,38 @@ class _BaseSXE(BaseEstimator):
         Quantile bins per feature for non-missing values; at most 255. Missing
         values occupy a further, reserved bin, as in scikit-learn's
         ``HistGradientBoosting*``.
-    max_depth_choices : tuple of int, default=(6, 8, 10, 12)
+    max_depth_choices : tuple of int or None, default=None
+        Per-tree depth, sampled uniformly; 0 means unlimited. None sizes the
+        trees to the data: (6, 8, 10, 12) below 20k training rows,
+        (8, 10, 12, 14) up to 100k, (10, 12, 14) above. Large-n strong-signal
+        data wants deeper trees than a fixed default grows.
         Per-tree max depth, sampled uniformly. 0 means unlimited (capped 64).
     max_leaf_nodes : int or None, default=None
         If set, grow leaf-wise with this leaf budget instead of depth-wise.
-    min_samples_leaf_range : tuple of int, default=(10, 60)
+    min_samples_leaf_range : tuple of int or None, default=None
+        Sampled log-uniformly per tree. None sizes the floor to the data:
+        (10, 60) below 20k training rows, (5, 30) up to 100k, (2, 15) above.
         Per-tree min_samples_leaf, sampled log-uniformly.
     max_features_range : tuple of float, default=(0.5, 1.0)
         Per-tree candidate-feature fraction, sampled uniformly.
+    holdout : {"batch", "random"}, default="batch"
+        How each tree's private pruning holdout is drawn. "batch" partitions
+        the training rows into ``holdout_folds`` folds afresh for every
+        batch; tree t grows on every fold but fold ``t mod F`` and prunes on
+        that fold, so each tree sees (F-1)/F of the data and each row is held
+        out by B/F of the batch's trees -- which also gives every training
+        row an honest out-of-batch prediction the weight fit can use.
+        "random" draws a per-tree subsample at a rate from
+        ``subsample_range`` and prunes on its complement.
+    holdout_folds : int, default=4
+        Folds per batch under ``holdout="batch"``; each tree then trains on
+        3/4 of the rows and prunes on the other quarter. Clamped to
+        ``batch_size``. Measured: 4 folds beat 8 on accuracy *and* size on
+        the classification sets; 8 is slightly better on smooth regression.
     subsample_range : tuple of float, default=(0.4, 0.75)
-        Per-tree row subsample rate. The complement is that tree's pruning
-        holdout, so rates near 1.0 leave little to prune against.
+        Per-tree row subsample rate under ``holdout="random"``. The
+        complement is that tree's pruning holdout, so rates near 1.0 leave
+        little to prune against.
     prune_strength_range : tuple of float, default=(1e-3, 1.0)
         Per-tree holdout pruning penalty lambda, sampled log-uniformly.
     leaf_shrinkage : float or None, default=None
@@ -164,6 +187,18 @@ class _BaseSXE(BaseEstimator):
         clipped to [0, 1] -- so a leaf the holdout contradicts is damped and
         one it confirms is kept whole. The value is the strength of the pull
         toward 1 (in holdout rows); 0 is the raw holdout fit. None disables.
+    linear_leaves : int, default=0
+        Regressor only. If > 0, every leaf carries a ridge model in the bin
+        ids of up to this many of the features split on the path above it
+        (LightGBM's ``linear_tree``, on quantile ranks rather than raw
+        values, so prediction needs nothing the binned model does not
+        already have). Smooth targets get a smooth fit from far fewer leaves.
+    linear_lambda : float, default=1.0
+        Ridge strength of the leaf models, per row, on standardised bin ids.
+    leaf_l2 : float, default=0.0
+        L2 penalty on leaf values: a node predicts ``sum(r) / (n + leaf_l2)``
+        rather than the mean, so small leaves are shrunk toward zero (the
+        Newton step with a constant hessian, LightGBM's ``lambda_l2``).
     hist_bits : int, default=0
         0 grows on exact residual histograms. A value in [2, 15] rounds each
         row's residual stochastically to that many bits per tree and scores
@@ -179,6 +214,14 @@ class _BaseSXE(BaseEstimator):
         Random cut-points per candidate feature when splitter="random".
     bundle_binary_features : bool, default=False
         Enable exclusive feature bundling for binary columns.
+    loss : {"logistic", "squared"}, default="logistic"
+        Classifier only. "logistic" grows each tree on the gradient of the
+        log-likelihood at the current logit, takes Newton leaf values
+        ``sum(y - p) / (sum(p(1-p)) + leaf_l2)``, early-stops on validation
+        deviance and fits the batch weights on the Newton working response;
+        softmax for more than two classes, with a temperature fitted on the
+        fold. "squared" is the older reduction: squared error on 0/1 targets,
+        leaf means as probability estimates, Platt-scaled.
     multiclass : {"vector", "ovr"}, default="vector"
         Classifier only; ignored for binary targets. "vector" grows one
         ensemble with K-vector leaves (structure shared across classes);
@@ -217,6 +260,13 @@ class _BaseSXE(BaseEstimator):
         Measured across the benchmark suite, "relaxed" improved every
         regression task and most classification tasks at equal or smaller
         size, which is why it is the default.
+    weight_tol : float, default=0.01
+        Size preference in the relaxed fit: among the (alpha, blend) pairs
+        whose cross-validated error is within this fraction of the best, take
+        the sparsest (largest penalty, then most shrinkage). A relative
+        tolerance rather than a standard-error rule, so it means the same
+        thing on a 3k-row fold and on 200k out-of-batch rows. 0 takes the
+        best outright.
     n_jobs : int or None, default=None
         Threads used for growth and prediction. ``None`` and ``-1`` both mean
         all available cores. Note this differs from the scikit-learn default
@@ -235,30 +285,37 @@ class _BaseSXE(BaseEstimator):
         self,
         *,
         learning_rate=0.07,
-        max_iter=300,
+        max_iter=None,
         batch_size=16,
         n_iter_no_change=15,
         tol=1e-4,
         validation_fraction=0.18,
         max_bins=255,
-        max_depth_choices=(6, 8, 10, 12),
+        max_depth_choices=None,
         max_leaf_nodes=None,
-        min_samples_leaf_range=(10, 60),
+        min_samples_leaf_range=None,
         max_features_range=(0.5, 1.0),
+        holdout="batch",
+        holdout_folds=4,
         subsample_range=(0.4, 0.75),
         prune_strength_range=(1e-3, 1.0),
         leaf_shrinkage=None,
+        linear_leaves=0,
+        linear_lambda=1.0,
+        leaf_l2=0.0,
         hist_bits=0,
         splitter="best",
         n_thresholds=2,
         bundle_binary_features=False,
         calibrate="sigmoid",
+        loss="logistic",
         multiclass="vector",
         hybrid_min=600,
         n_alphas=20,
         weight_cv=3,
         l1_ratio=1.0,
         weight_refit="relaxed",
+        weight_tol=0.01,
         n_jobs=None,
         random_state=None,
         verbose=0,
@@ -274,20 +331,27 @@ class _BaseSXE(BaseEstimator):
         self.max_leaf_nodes = max_leaf_nodes
         self.min_samples_leaf_range = min_samples_leaf_range
         self.max_features_range = max_features_range
+        self.holdout = holdout
+        self.holdout_folds = holdout_folds
         self.subsample_range = subsample_range
         self.prune_strength_range = prune_strength_range
         self.leaf_shrinkage = leaf_shrinkage
+        self.linear_leaves = linear_leaves
+        self.linear_lambda = linear_lambda
+        self.leaf_l2 = leaf_l2
         self.hist_bits = hist_bits
         self.splitter = splitter
         self.n_thresholds = n_thresholds
         self.bundle_binary_features = bundle_binary_features
         self.calibrate = calibrate
+        self.loss = loss
         self.multiclass = multiclass
         self.hybrid_min = hybrid_min
         self.n_alphas = n_alphas
         self.weight_cv = weight_cv
         self.l1_ratio = l1_ratio
         self.weight_refit = weight_refit
+        self.weight_tol = weight_tol
         self.n_jobs = n_jobs
         self.random_state = random_state
         self.verbose = verbose
@@ -310,8 +374,14 @@ class _BaseSXE(BaseEstimator):
             raise ValueError(f"calibrate must be 'sigmoid' or None, got {self.calibrate!r}")
         if self.learning_rate <= 0:
             raise ValueError(f"learning_rate must be > 0, got {self.learning_rate}")
-        if self.max_iter < 1:
-            raise ValueError(f"max_iter must be >= 1, got {self.max_iter}")
+        if self.max_iter is not None and self.max_iter < 1:
+            raise ValueError(f"max_iter must be >= 1 or None, got {self.max_iter}")
+        if self.holdout not in ("batch", "random"):
+            raise ValueError(f"holdout must be 'batch' or 'random', got {self.holdout!r}")
+        if self.holdout == "batch" and int(self.holdout_folds) < 2:
+            raise ValueError(f"holdout_folds must be >= 2, got {self.holdout_folds}")
+        if not self.weight_tol >= 0:
+            raise ValueError(f"weight_tol must be >= 0, got {self.weight_tol}")
         if self.batch_size < 1:
             raise ValueError(f"batch_size must be >= 1, got {self.batch_size}")
         if self.n_iter_no_change < 1:
@@ -330,6 +400,14 @@ class _BaseSXE(BaseEstimator):
             raise ValueError(f"max_leaf_nodes must be >= 2 or None, got {self.max_leaf_nodes}")
         if self.hybrid_min < 1:
             raise ValueError(f"hybrid_min must be >= 1, got {self.hybrid_min}")
+        if self.loss not in ("squared", "logistic"):
+            raise ValueError(f"loss must be 'squared' or 'logistic', got {self.loss!r}")
+        if not 0 <= int(self.linear_leaves) <= 255:
+            raise ValueError(f"linear_leaves must be in [0, 255], got {self.linear_leaves}")
+        if not self.linear_lambda > 0:
+            raise ValueError(f"linear_lambda must be > 0, got {self.linear_lambda}")
+        if not self.leaf_l2 >= 0:
+            raise ValueError(f"leaf_l2 must be >= 0, got {self.leaf_l2}")
         if not (self.hist_bits == 0 or 2 <= int(self.hist_bits) <= 15):
             raise ValueError(f"hist_bits must be 0 or in [2, 15], got {self.hist_bits}")
         if self.weight_refit not in ("relaxed", None):
@@ -337,13 +415,15 @@ class _BaseSXE(BaseEstimator):
         if self.leaf_shrinkage is not None and not self.leaf_shrinkage >= 0:
             raise ValueError(f"leaf_shrinkage must be >= 0 or None, got {self.leaf_shrinkage}")
 
-        depths = list(self.max_depth_choices)
-        if not depths:
-            raise ValueError("max_depth_choices must be non-empty")
-        if any(int(d) < 0 for d in depths):
-            raise ValueError(f"max_depth_choices entries must be >= 0, got {depths}")
+        depths = None
+        if self.max_depth_choices is not None:
+            depths = list(self.max_depth_choices)
+            if not depths:
+                raise ValueError("max_depth_choices must be non-empty")
+            if any(int(d) < 0 for d in depths):
+                raise ValueError(f"max_depth_choices entries must be >= 0, got {depths}")
 
-        leaf = _pair("min_samples_leaf_range", lo_min=1)
+        leaf = None if self.min_samples_leaf_range is None else _pair("min_samples_leaf_range", lo_min=1)
         feat = _pair("max_features_range", lo_min=0.0)
         sub = _pair("subsample_range", lo_min=0.0)
         lam = _pair("prune_strength_range")
@@ -362,6 +442,27 @@ class _BaseSXE(BaseEstimator):
 
     def _n_jobs(self):
         return -1 if self.n_jobs is None else self.n_jobs
+
+    @staticmethod
+    def _structural_defaults(n_train):
+        """Tree size and trajectory length for the data at hand.
+
+        Measured on the benchmark suite: the datasets where the defaults gave
+        up the most to tuning were exactly the large ones, which wanted
+        deeper trees and smaller leaves than a fixed default grows; the small
+        ones were already as close to their tuned selves as LightGBM's.
+        """
+        if n_train < 20_000:
+            return (6, 8, 10, 12), (10, 60), 600
+        if n_train < 100_000:
+            return (8, 10, 12, 14), (5, 30), 600
+        return (10, 12, 14), (2, 15), 300
+
+    def _is_classifier(self):
+        return isinstance(self, ClassifierMixin) or isinstance(self, _CalibratesBinary)
+
+    def _logistic(self):
+        return self.loss == "logistic" and self._is_classifier()
 
     # -- weight fit ----------------------------------------------------------
     def _fit_weights(self, P, y_val):
@@ -406,64 +507,102 @@ class _BaseSXE(BaseEstimator):
         return w, b
 
     @staticmethod
-    def _nnls_refit(P, y, support):
-        """Non-negative least squares with a free intercept on the given columns."""
+    def _wcenter(P, y, sw):
+        """Weighted centring and sqrt-weight scaling for a weighted LS problem."""
+        if sw is None:
+            pm, ym = P.mean(axis=0), float(y.mean())
+            return P - pm, y - ym, pm, ym
+        tot = float(sw.sum())
+        pm, ym = (sw @ P) / tot, float(sw @ y) / tot
+        root = np.sqrt(sw)[:, None]
+        return (P - pm) * root, (y - ym) * root[:, 0], pm, ym
+
+    def _nnls_refit(self, P, y, support, sw=None):
+        """Non-negative (weighted) least squares with a free intercept."""
         w = np.zeros(P.shape[1])
+        Pc, yc, pm, ym = self._wcenter(P[:, support], y, sw)
         if support.size == 0:
-            return w, float(y.mean())
-        Ps = P[:, support]
-        pm, ym = Ps.mean(axis=0), float(y.mean())
-        coef, _ = nnls(Ps - pm, y - ym)
+            return w, ym
+        coef, _ = nnls(Pc, yc)
         w[support] = coef
         return w, ym - float(pm @ coef)
 
-    def _fit_weights_relaxed(self, P, y_val, l1, cv):
+    def _fit_weights_relaxed(self, P, y_val, l1, cv, sw=None):
         """Relaxed positive lasso: choose (alpha, blend) by CV over the fold.
 
         For every alpha on the path the lasso picks a support; the refit is
         NNLS on that support; the candidate solutions are the blends
         ``phi * lasso + (1 - phi) * refit``. The pair minimising CV error is
-        refitted on the whole fold.
+        refitted on the whole fold. ``sw`` are optional row weights (the
+        logistic loss fits its Newton working response this way).
         """
         phis = np.array([1.0, 0.75, 0.5, 0.25, 0.0])
         n_alphas = int(self.n_alphas)
+
+        def path(Pa, ya, wa, **kw):
+            Pc, yc, pm, ym = self._wcenter(Pa, ya, wa)
+            alphas, coefs, _ = enet_path(Pc, yc, l1_ratio=l1, positive=True, **kw)
+            return alphas, coefs, pm, ym
+
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             # enet_path works on centred data (no intercept); the alpha grid
             # it derives from the whole fold is reused on every CV split.
-            alphas, _, _ = enet_path(
-                P - P.mean(axis=0), y_val - y_val.mean(), l1_ratio=l1,
-                n_alphas=n_alphas, positive=True,
-            )
+            alphas, _, _, _ = path(P, y_val, sw, n_alphas=n_alphas)
             folds = list(KFold(cv, shuffle=False).split(P))
             err = np.zeros((len(alphas), len(phis)))
             for tr, te in folds:
-                Ptr, ytr = P[tr], y_val[tr]
-                pm, ym = Ptr.mean(axis=0), ytr.mean()
-                _, coefs, _ = enet_path(
-                    Ptr - pm, ytr - ym, l1_ratio=l1, alphas=alphas, positive=True
-                )
+                swtr = None if sw is None else sw[tr]
+                _, coefs, pm, ym = path(P[tr], y_val[tr], swtr, alphas=alphas)
+                wte = 1.0 if sw is None else sw[te]
                 for a in range(len(alphas)):
                     w_l = coefs[:, a]
                     b_l = ym - pm @ w_l
-                    w_r, b_r = self._nnls_refit(Ptr, ytr, np.flatnonzero(w_l > 1e-10))
+                    w_r, b_r = self._nnls_refit(P[tr], y_val[tr], np.flatnonzero(w_l > 1e-10), swtr)
                     for k, phi in enumerate(phis):
                         w = phi * w_l + (1.0 - phi) * w_r
                         b = phi * b_l + (1.0 - phi) * b_r
                         res = y_val[te] - (P[te] @ w + b)
-                        err[a, k] += float(res @ res)
+                        err[a, k] += float((wte * res) @ res)
             a_best, k_best = np.unravel_index(np.argmin(err), err.shape)
+            # size preference: the sparsest pair (largest alpha, then most
+            # shrinkage) whose CV error is within weight_tol of the best
+            limit = err[a_best, k_best] * (1.0 + float(self.weight_tol))
+            ok = np.argwhere(err <= limit)
+            if ok.size:
+                a_best, k_best = min((int(a), int(k)) for a, k in ok)  # alphas descend
             alpha, phi = float(alphas[a_best]), float(phis[k_best])
-            en = ElasticNet(alpha=alpha, l1_ratio=l1, positive=True, max_iter=6000).fit(P, y_val)
-            w_l, b_l = en.coef_.copy(), float(en.intercept_)
-            w_r, b_r = self._nnls_refit(P, y_val, np.flatnonzero(w_l > 1e-10))
+            _, coefs, pm, ym = path(P, y_val, sw, alphas=[alpha])
+            w_l = coefs[:, 0]
+            b_l = ym - pm @ w_l
+            w_r, b_r = self._nnls_refit(P, y_val, np.flatnonzero(w_l > 1e-10), sw)
             w = phi * w_l + (1.0 - phi) * w_r
             b = phi * b_l + (1.0 - phi) * b_r
             if not np.any(w > 1e-10):
-                en = ElasticNet(alpha=alpha * 1e-3, l1_ratio=1.0, positive=True, max_iter=6000)
-                en.fit(P, y_val)
-                w, b = en.coef_.copy(), float(en.intercept_)
+                _, coefs, pm, ym = path(P, y_val, sw, alphas=[alpha * 1e-3])
+                w = coefs[:, 0]
+                b = ym - pm @ w
         return w, b
+
+    def _fit_weights_logistic(self, Pb, y_val, cv, n_out):
+        """Batch weights for the logistic loss: one Newton step of the deviance.
+
+        The generation ensemble's validation logit is ``F = lr * sum_b Pb``;
+        around it the log-likelihood is a weighted least-squares problem in
+        the working response ``z = F + (y - p) / (p (1 - p))`` with weights
+        ``p (1 - p)`` (diagonal Hessian; softmax for K > 1), which the relaxed
+        positive lasso then solves. Rows are the K outputs of every sample.
+        """
+        F = float(self.learning_rate) * Pb.sum(axis=1)
+        if n_out > 1:
+            Fk = F.reshape(-1, n_out)
+            e = np.exp(Fk - Fk.max(axis=1, keepdims=True))
+            p = (e / e.sum(axis=1, keepdims=True)).ravel()
+        else:
+            p = 1.0 / (1.0 + np.exp(-F))
+        h = np.clip(p * (1.0 - p), 1e-6, None)
+        z = F + (y_val - p) / h
+        return self._fit_weights_relaxed(Pb, z, 1.0, cv, sw=h)
 
     # -- fit -----------------------------------------------------------------
     def _fit(self, X, y):
@@ -498,20 +637,46 @@ class _BaseSXE(BaseEstimator):
         y_val = np.ascontiguousarray(y[val_idx])
 
         batch = int(self.batch_size)
-        # a (n, K) target early-stops on the MSE summed over its K columns
-        var_val = float(np.var(y_val, axis=0).sum()) if y_val.ndim == 2 else float(np.var(y_val))
+        d_depths, d_leaf, d_iter = self._structural_defaults(len(tr_idx))
+        depths = d_depths if depths is None else depths
+        leaf = d_leaf if leaf is None else leaf
+        max_iter = d_iter if self.max_iter is None else int(self.max_iter)
+        self.max_depth_choices_, self.min_samples_leaf_range_, self.max_iter_ = (
+            tuple(int(d) for d in depths), (int(leaf[0]), int(leaf[1])), int(max_iter)
+        )
+        # Early-stopping tolerance in the units the loop watches: MSE (a
+        # fraction of the target variance) or deviance (a fraction of the
+        # base-rate entropy).
+        if self._logistic():
+            freq = np.clip(np.mean(y_val, axis=0), 1e-6, 1 - 1e-6)
+            if y_val.ndim == 2:
+                scale = float(-(freq * np.log(freq)).sum())
+            else:
+                scale = float(-(freq * np.log(freq) + (1 - freq) * np.log(1 - freq)))
+        else:
+            # a (n, K) target early-stops on the MSE summed over its K columns
+            scale = float(np.var(y_val, axis=0).sum()) if y_val.ndim == 2 else float(np.var(y_val))
+        # Out-of-batch predictions are collected for a bounded subset of the
+        # training rows: the weight fit's design is then those rows plus the
+        # validation fold, rather than the fold alone.
+        n_out = y_val.shape[1] if y_val.ndim == 2 else 1
+        folds = int(self.holdout_folds) if self.holdout == "batch" else 0
+        n_oob = min(len(tr_idx), max(2000, 200_000 // n_out)) if folds else 0
+        oob_idx = np.ascontiguousarray(np.sort(rng.permutation(len(tr_idx))[:n_oob]), dtype=np.int32)
         ens = _core.Ensemble()
         t_grow = time.perf_counter()
-        n_members, n_batches = ens.boost(
+        n_members, n_batches, P_oob = ens.boost(
             X=Xtr,
             y=ytr,
             X_val=Xval,
             y_val=y_val,
+            holdout_folds=folds,
+            oob_idx=oob_idx,
             batch=batch,
-            max_batches=int(self.max_iter),
+            max_batches=int(max_iter),
             shrink=float(self.learning_rate),
             patience=int(self.n_iter_no_change),
-            tol=float(self.tol) * var_val,
+            tol=float(self.tol) * scale,
             n_thresh=int(self.n_thresholds),
             argmax_bins=1 if self.splitter == "best" else 0,
             max_leaves=0 if self.max_leaf_nodes is None else int(self.max_leaf_nodes),
@@ -526,6 +691,10 @@ class _BaseSXE(BaseEstimator):
             lam_hi=lam[1],
             leaf_shrink=-1.0 if self.leaf_shrinkage is None else float(self.leaf_shrinkage),
             hist_bits=int(self.hist_bits),
+            leaf_l2=float(self.leaf_l2),
+            loss=1 if self._logistic() else 0,
+            linear_feats=int(self.linear_leaves) if not self._is_classifier() else 0,
+            linear_lambda=float(self.linear_lambda),
             hybrid_min=int(self.hybrid_min),
             seed=int(rng.integers(2**63 - 1)),
             n_jobs=n_jobs,
@@ -539,7 +708,23 @@ class _BaseSXE(BaseEstimator):
         # For a K-column target the design matrix stacks the K outputs of
         # every validation row -- one weight per batch, shared by all K.
         Pb = ens.predict_batch_means(Xval, batch, n_jobs)
-        w_batch, intercept = self._fit_weights(Pb, np.ascontiguousarray(y_val).ravel())
+        yflat = np.ascontiguousarray(y_val).ravel()
+        if folds and P_oob.shape[0]:
+            # honest rows from the training fold on top of the validation
+            # fold; rows shuffled with a fixed permutation so the CV folds
+            # of the weight fit mix both sources
+            P_all = np.vstack([P_oob, Pb])
+            y_all = np.concatenate([np.ascontiguousarray(ytr[oob_idx]).ravel(), yflat])
+            order = np.random.default_rng(0).permutation(len(y_all))
+            Pb_fit, y_fit = np.ascontiguousarray(P_all[order]), y_all[order]
+        else:
+            Pb_fit, y_fit = Pb, yflat
+        if self._logistic():
+            w_batch, intercept = self._fit_weights_logistic(
+                Pb_fit, y_fit, int(min(self.weight_cv, len(y_fit))), ens.n_out
+            )
+        else:
+            w_batch, intercept = self._fit_weights(Pb_fit, y_fit)
         sel_b = np.flatnonzero(w_batch > 1e-10)
         if sel_b.size == 0:  # degenerate: keep the first batch at zero weight
             sel_b = np.array([0], dtype=np.int64)
@@ -739,6 +924,19 @@ class _CalibratesBinary:
         s = self.ensemble_.predict_weighted(
             Xval, self._members, self.weights_, self.intercept_, n_jobs
         )
+        if s.ndim == 2 and self._logistic():
+            # the scores are logits: a softmax with one temperature fitted
+            # on the fold by minimising the multinomial deviance
+            lab = np.argmax(y_val, axis=1)
+
+            def dev(log_t):
+                z = s / np.exp(log_t)
+                z = z - z.max(axis=1, keepdims=True)
+                lse = np.log(np.exp(z).sum(axis=1))
+                return float(np.mean(lse - z[np.arange(len(z)), lab]))
+
+            res = minimize_scalar(dev, bounds=(-3.0, 3.0), method="bounded")
+            return ("softmax", float(np.exp(res.x)))
         if s.ndim == 2:
             # one sigmoid per class column; all or none, so the columns stay
             # on one scale before they are normalised to a distribution
@@ -750,9 +948,20 @@ class _CalibratesBinary:
         """Map raw ensemble scores onto [0, 1], column by column if 2-D."""
         cal = getattr(self, "calibrator_", None)
         if cal is not None:
+            if isinstance(cal, tuple) and cal[0] == "softmax":
+                z = scores / cal[1]
+                z = z - z.max(axis=1, keepdims=True)
+                e = np.exp(z)
+                return e / e.sum(axis=1, keepdims=True)
             if scores.ndim == 2:
                 return np.column_stack([_apply_platt(c, scores[:, k]) for k, c in enumerate(cal)])
             return _apply_platt(cal, scores)
+        if scores.ndim == 2 and self._logistic():
+            z = scores - scores.max(axis=1, keepdims=True)
+            e = np.exp(z)
+            return e / e.sum(axis=1, keepdims=True)
+        if self._logistic():
+            return 1.0 / (1.0 + np.exp(-scores))
         # Uncalibrated fallback. Clipping is crude: it collapses both tails
         # into ties, which perturbs ranking metrics as well as log-loss.
         return np.clip(scores, 1e-6, 1 - 1e-6)

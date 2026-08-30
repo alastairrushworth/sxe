@@ -1,6 +1,8 @@
 """Bad input must produce a clear Python exception, never a crash or a
 silently wrong answer."""
 
+import pickle
+
 import numpy as np
 import pytest
 from sklearn.datasets import make_classification, make_regression
@@ -182,3 +184,58 @@ def test_leaf_shrinkage_never_amplifies_a_leaf():
     step = np.ptp(y) / 65535.0
     assert (b <= a + step).all()
     assert (b < a - step).any()
+
+
+def test_structural_defaults_follow_the_training_size():
+    from sklearn.datasets import make_regression
+
+    from sxe import SXERegressor
+
+    X, y = make_regression(n_samples=1200, n_features=6, random_state=0)
+    m = SXERegressor(random_state=0, max_iter=3, batch_size=4).fit(X, y)
+    assert m.max_depth_choices_ == (6, 8, 10, 12)
+    assert m.min_samples_leaf_range_ == (10, 60)
+    assert m.max_iter_ == 3  # an explicit max_iter is kept
+    small, mid, big = (SXERegressor._structural_defaults(n) for n in (10_000, 50_000, 200_000))
+    assert small[0] == (6, 8, 10, 12) and mid[0] == (8, 10, 12, 14) and big[0] == (10, 12, 14)
+    assert small[1][0] > mid[1][0] > big[1][0]
+    assert small[2] == mid[2] == 600 and big[2] == 300
+
+
+def test_holdout_modes_and_new_parameters_are_validated():
+    from sklearn.datasets import make_regression
+
+    from sxe import SXERegressor
+
+    X, y = make_regression(n_samples=400, n_features=6, random_state=0)
+    with pytest.raises(ValueError, match="holdout"):
+        SXERegressor(holdout="oob").fit(X, y)
+    with pytest.raises(ValueError, match="holdout_folds"):
+        SXERegressor(holdout_folds=1).fit(X, y)
+    with pytest.raises(ValueError, match="weight_tol"):
+        SXERegressor(weight_tol=-1.0).fit(X, y)
+    with pytest.raises(ValueError, match="linear_leaves"):
+        SXERegressor(linear_leaves=300).fit(X, y)
+    with pytest.raises(ValueError, match="linear_lambda"):
+        SXERegressor(linear_leaves=2, linear_lambda=0.0).fit(X, y)
+    with pytest.raises(ValueError, match="loss"):
+        SXEClassifier(loss="hinge").fit(X, (y > 0).astype(int))
+    # folds beyond the batch width are clamped, not rejected
+    SXERegressor(random_state=0, max_iter=2, batch_size=4, holdout_folds=16).fit(X, y)
+
+
+def test_linear_leaves_round_trip_and_change_predictions():
+    from sklearn.datasets import make_regression
+
+    from sxe import SXERegressor
+
+    X, y = make_regression(n_samples=1500, n_features=5, noise=1.0, random_state=0)
+    cfg = dict(random_state=0, max_iter=4, batch_size=4, max_depth_choices=(3,))
+    const = SXERegressor(**cfg).fit(X, y)
+    lin = SXERegressor(linear_leaves=3, **cfg).fit(X, y)
+    assert not np.array_equal(const.predict(X), lin.predict(X))
+    restored = pickle.loads(pickle.dumps(lin))
+    assert np.array_equal(lin.predict(X), restored.predict(X))
+    assert lin.tree_bytes_ == len(lin.ensemble_.serialize())
+    # a linear leaf reads its features' bin ids, so their edges must ship
+    assert lin.bin_table_bytes_ > 0

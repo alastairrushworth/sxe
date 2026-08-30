@@ -176,6 +176,14 @@ struct Tree {
     std::vector<double>  val;    // nout values per node: val[id*nout + k]
     std::vector<double>  gain;   // split gain at internal nodes, 0 at leaves
     int32_t nout = 1;
+    // Linear leaves (regression only): leaf id predicts
+    //   val[id] + sum_j lin_coef[lin_start[id] + j] * bin(lin_feat[...][j])
+    // over lin_cnt[id] path features; lin_cnt is 0 for a constant leaf.
+    std::vector<uint8_t> lin_cnt;
+    std::vector<int32_t> lin_start;
+    std::vector<int32_t> lin_feat;
+    std::vector<double>  lin_coef;
+    double lin_a = 0.0, lin_b = 0.0;   // 16-bit code map for the coefficients
     int32_t n_leaves = 0;
     int32_t base_id = -1;   // which grown tree this member came from
     int32_t variant = 0;    // 0 raw, 2 random lambda
@@ -195,6 +203,9 @@ struct GrownTree {
     std::vector<double>  h_cnt, h_sum, h_ssq;       // holdout stats per node:
                                                     // cnt, K sums, one total ssq
     std::vector<int64_t> lo, hi;                    // node's row range in ws.idx
+    std::vector<uint8_t> lin_cnt;                   // linear leaves, as in Tree
+    std::vector<int32_t> lin_start, lin_feat;
+    std::vector<double>  lin_coef;
 };
 
 struct Hist {
@@ -242,6 +253,7 @@ struct Workspace {
 
 struct TreeParams {
     int max_depth, min_leaf, K, n_thresh;
+    double leaf_l2 = 0.0;  // L2 on leaf values: mean = sum / (n + leaf_l2)
     int argmax_bins = 0;   // 1 = evaluate the BEST cut per candidate feature
     int max_leaves = 0;    // >0 = leaf-wise (best-first) growth with this budget
     double lam_lo, lam_hi;
@@ -268,7 +280,7 @@ inline double split_gain(int K, int64_t cl, int64_t cr, const double* sl,
 // squares, per-target means and the parent term sum_k S_k^2 / m.
 inline double node_stats(const double* y, int K, const std::vector<int64_t>& idx,
                          int64_t lo, int64_t hi, double* sumk, double* meank,
-                         double& parent_term)
+                         double& parent_term, double leaf_l2 = 0.0)
 {
     const int64_t m = hi - lo;
     for (int k = 0; k < K; ++k) sumk[k] = 0.0;
@@ -285,7 +297,7 @@ inline double node_stats(const double* y, int K, const std::vector<int64_t>& idx
     }
     parent_term = 0.0;
     for (int k = 0; k < K; ++k) {
-        meank[k] = sumk[k] / (double)m;
+        meank[k] = leaf_l2 > 0.0 ? sumk[k] / ((double)m + leaf_l2) : sumk[k] / (double)m;
         parent_term += sumk[k] * sumk[k] / (double)m;
     }
     return ssq;
@@ -338,7 +350,7 @@ int32_t grow_node_legacy(GrownTree& T, const uint8_t* X, const double* y,
     const int Kt = ws.nout;
     double* sumk = ws.sumk.data(); double* meank = ws.meank.data(); double* sl = ws.sl.data();
     double parent_term;
-    const double ssq = node_stats(y, Kt, ws.idx, lo, hi, sumk, meank, parent_term);
+    const double ssq = node_stats(y, Kt, ws.idx, lo, hi, sumk, meank, parent_term, tp.leaf_l2);
     const int32_t id = push_node(T, Kt, meank, lo, hi);
 
     if (depth >= tp.max_depth || m < 2 * (int64_t)tp.min_leaf || node_pure(Kt, ssq, sumk, meank))
@@ -639,7 +651,7 @@ int32_t grow_node_full(GrownTree& T, const uint8_t* X, const double* y,
     const int Kt = ws.nout;
     double* sumk = ws.sumk.data(); double* meank = ws.meank.data();
     double parent_term;
-    const double ssq = node_stats(y, Kt, ws.idx, lo, hi, sumk, meank, parent_term);
+    const double ssq = node_stats(y, Kt, ws.idx, lo, hi, sumk, meank, parent_term, tp.leaf_l2);
     const int32_t id = push_node(T, Kt, meank, lo, hi);
 
     if (depth >= tp.max_depth || m < 2 * (int64_t)tp.min_leaf || node_pure(Kt, ssq, sumk, meank))
@@ -724,14 +736,16 @@ void grow_tree_leafwise(GrownTree& T, const uint8_t* X, const double* y,
             const double* yi = y + ws.idx[i] * Kt;
             for (int k = 0; k < Kt; ++k) sumk[k] += yi[k];
         }
-        for (int k = 0; k < Kt; ++k) meank[k] = sumk[k] / (double)(hi - lo);
+        const double denom = (double)(hi - lo) + tp.leaf_l2;
+        for (int k = 0; k < Kt; ++k) meank[k] = sumk[k] / denom;
         return push_node(T, Kt, meank, lo, hi);
     };
     // per-target sums and the parent term of a node, from its stored means
     auto node_sums = [&](int32_t id, int64_t lo, int64_t hi, double* sumk) {
         double pt = 0.0;
+        const double denom = (double)(hi - lo) + tp.leaf_l2;
         for (int k = 0; k < Kt; ++k) {
-            sumk[k] = T.val[(size_t)id * Kt + k] * (double)(hi - lo);
+            sumk[k] = T.val[(size_t)id * Kt + k] * denom;
             pt += sumk[k] * sumk[k] / (double)(hi - lo);
         }
         return pt;
@@ -843,6 +857,163 @@ void exported_leaf_of(const GrownTree& T, const std::vector<uint8_t>* collapsed,
     }
 }
 
+// Newton leaf values for a second-order loss: every exported leaf predicts
+// sum(g) / (sum(h) + l2) over the training rows it holds instead of the mean
+// of g. Grown leaves feed their collapsed ancestor through rep[]. Structure
+// and pruning were decided on the means; only the exported values change.
+void newton_refit(GrownTree& T, int K, const std::vector<int32_t>& rep,
+                  const std::vector<int64_t>& idx, const double* g, const double* h,
+                  double l2)
+{
+    const int32_t nn = (int32_t)T.feat.size();
+    std::vector<double> sg((size_t)nn * K, 0.0), sh((size_t)nn * K, 0.0);
+    for (int32_t id = 0; id < nn; ++id) {
+        if (T.feat[id] >= 0) continue;
+        const int32_t r = rep[id];
+        for (int64_t i = T.lo[id]; i < T.hi[id]; ++i) {
+            const int64_t row = idx[i];
+            for (int k = 0; k < K; ++k) {
+                sg[(size_t)r * K + k] += g[row * K + k];
+                sh[(size_t)r * K + k] += h[row * K + k];
+            }
+        }
+    }
+    for (int32_t id = 0; id < nn; ++id) {
+        if (rep[id] != id) continue;  // only exported leaves
+        for (int k = 0; k < K; ++k) {
+            const double den = sh[(size_t)id * K + k] + l2;
+            T.val[(size_t)id * K + k] = den > 0.0 ? sg[(size_t)id * K + k] / den : 0.0;
+        }
+    }
+}
+
+// Linear leaves (LightGBM's linear_tree, on bin indices): every exported leaf
+// gets a ridge model in the bin ids of up to `max_feats` of the features
+// split on the path above it (the highest-gain ones), fitted on the training
+// rows it holds. The leaf's constant stays its mean, so a zero coefficient
+// vector is exactly the constant leaf; pruning was decided on the constants.
+// Bin ids are a monotone (quantile) transform of the raw feature, already in
+// memory at predict time, so the model needs no raw values and no new table.
+void fit_linear_leaves(GrownTree& T, const std::vector<int32_t>& rep,
+                       const std::vector<int64_t>& idx, const uint8_t* X, int64_t n,
+                       const double* y, int max_feats, double lam)
+{
+    const int32_t nn = (int32_t)T.feat.size();
+    T.lin_cnt.assign(nn, 0); T.lin_start.assign(nn, -1);
+    T.lin_feat.clear(); T.lin_coef.clear();
+    if (max_feats <= 0) return;
+    std::vector<int32_t> parent(nn, -1);
+    for (int32_t id = 0; id < nn; ++id)
+        if (T.feat[id] >= 0) { parent[T.left[id]] = id; parent[T.right[id]] = id; }
+    // rows of each exported leaf: grown leaves feed their collapsed ancestor
+    std::vector<std::vector<int64_t>> rows(nn);
+    for (int32_t id = 0; id < nn; ++id) {
+        if (T.feat[id] >= 0) continue;
+        std::vector<int64_t>& dst = rows[rep[id]];
+        for (int64_t i = T.lo[id]; i < T.hi[id]; ++i) dst.push_back(idx[i]);
+    }
+    std::vector<std::pair<double, int>> path;
+    std::vector<int> feats;
+    std::vector<double> A, g, m, sdev, beta;
+    for (int32_t id = 0; id < nn; ++id) {
+        if (rep[id] != id) continue;
+        const std::vector<int64_t>& R = rows[id];
+        // candidate features: distinct split features on the path, by gain
+        path.clear();
+        for (int32_t a = parent[id]; a >= 0; a = parent[a]) {
+            bool seen = false;
+            for (auto& pr : path) if (pr.second == T.feat[a]) { seen = true; pr.first = std::max(pr.first, T.gain[a]); }
+            if (!seen) path.push_back({T.gain[a], T.feat[a]});
+        }
+        if (path.empty()) continue;
+        std::sort(path.begin(), path.end(), [](const std::pair<double,int>& u, const std::pair<double,int>& v) {
+            return u.first > v.first || (u.first == v.first && u.second < v.second); });
+        const int d = std::min<int>(max_feats, (int)path.size());
+        const int64_t m_rows = (int64_t)R.size();
+        if (m_rows < 2 * d + 5) continue;
+        feats.assign(d, 0);
+        for (int j = 0; j < d; ++j) feats[j] = path[j].second;
+        // standardise each feature's bin id within the leaf
+        m.assign(d, 0.0); sdev.assign(d, 0.0);
+        for (int j = 0; j < d; ++j) {
+            const uint8_t* col = X + (int64_t)feats[j] * n;
+            double s1 = 0.0, s2 = 0.0;
+            for (int64_t r : R) { const double v = col[r]; s1 += v; s2 += v * v; }
+            m[j] = s1 / (double)m_rows;
+            const double var = s2 / (double)m_rows - m[j] * m[j];
+            sdev[j] = var > 1e-12 ? std::sqrt(var) : 0.0;
+        }
+        double ymean = 0.0;
+        for (int64_t r : R) ymean += y[r];
+        ymean /= (double)m_rows;
+        // normal equations (X'X + lam*m I) beta = X'(y - ymean)
+        A.assign((size_t)d * d, 0.0); g.assign(d, 0.0);
+        std::vector<double> xr(d);
+        for (int64_t r : R) {
+            for (int j = 0; j < d; ++j)
+                xr[j] = sdev[j] > 0.0 ? ((double)X[(int64_t)feats[j] * n + r] - m[j]) / sdev[j] : 0.0;
+            const double yr = y[r] - ymean;
+            for (int j = 0; j < d; ++j) {
+                g[j] += xr[j] * yr;
+                for (int k = 0; k <= j; ++k) A[(size_t)j * d + k] += xr[j] * xr[k];
+            }
+        }
+        for (int j = 0; j < d; ++j) {
+            A[(size_t)j * d + j] += lam * (double)m_rows;
+            for (int k = j + 1; k < d; ++k) A[(size_t)j * d + k] = A[(size_t)k * d + j];
+        }
+        // Cholesky solve (A is SPD with lam > 0; sdev == 0 columns are pure ridge)
+        bool ok = true;
+        for (int j = 0; j < d && ok; ++j) {
+            for (int k = 0; k <= j; ++k) {
+                double sum = A[(size_t)j * d + k];
+                for (int t = 0; t < k; ++t) sum -= A[(size_t)j * d + t] * A[(size_t)k * d + t];
+                if (j == k) { if (sum <= 0.0) { ok = false; break; } A[(size_t)j * d + j] = std::sqrt(sum); }
+                else A[(size_t)j * d + k] = sum / A[(size_t)k * d + k];
+            }
+        }
+        if (!ok) continue;
+        beta.assign(d, 0.0);
+        for (int j = 0; j < d; ++j) {  // forward: L z = g
+            double sum = g[j];
+            for (int t = 0; t < j; ++t) sum -= A[(size_t)j * d + t] * beta[t];
+            beta[j] = sum / A[(size_t)j * d + j];
+        }
+        for (int j = d - 1; j >= 0; --j) {  // backward: L' beta = z
+            double sum = beta[j];
+            for (int t = j + 1; t < d; ++t) sum -= A[(size_t)t * d + j] * beta[t];
+            beta[j] = sum / A[(size_t)j * d + j];
+        }
+        // back to bin units: v = c + sum w_j * bin_j, with c absorbing the means
+        T.lin_start[id] = (int32_t)T.lin_feat.size();
+        double c = T.val[id];
+        int cnt = 0;
+        for (int j = 0; j < d; ++j) {
+            if (sdev[j] <= 0.0) continue;
+            const double w = beta[j] / sdev[j];
+            if (w == 0.0) continue;
+            T.lin_feat.push_back(feats[j]); T.lin_coef.push_back(w);
+            c -= w * m[j];
+            ++cnt;
+        }
+        T.lin_cnt[id] = (uint8_t)cnt;
+        T.val[id] = c;
+        if (cnt == 0) T.lin_start[id] = -1;
+    }
+}
+
+// value of node id for row r (K == 1), honouring a linear leaf
+template <class TreeT>
+inline double node_value(const TreeT& T, int32_t id, const uint8_t* X, int64_t n, int64_t r) {
+    double v = T.val[id];
+    if (!T.lin_cnt.empty() && T.lin_cnt[id]) {
+        const int32_t s0 = T.lin_start[id];
+        for (int j = 0; j < (int)T.lin_cnt[id]; ++j)
+            v += T.lin_coef[(size_t)s0 + j] * (double)X[(int64_t)T.lin_feat[(size_t)s0 + j] * n + r];
+    }
+    return v;
+}
+
 // Training-fold prediction without a tree walk: every subsample row sits in
 // its grown leaf's range of ws.idx, and every holdout row's leaf was recorded
 // while routing. Both read the same leaf value the exported member carries,
@@ -850,9 +1021,19 @@ void exported_leaf_of(const GrownTree& T, const std::vector<uint8_t>* collapsed,
 void predict_train_from_ranges(const GrownTree& T, int K, const std::vector<int32_t>& rep,
                                const std::vector<int64_t>& idx,
                                const std::vector<int64_t>& hold,
-                               const std::vector<int32_t>& leaf_of, double* out)
+                               const std::vector<int32_t>& leaf_of, double* out,
+                               const uint8_t* X = nullptr, int64_t n = 0)
 {
     const int32_t nn = (int32_t)T.feat.size();
+    if (K == 1 && !T.lin_cnt.empty()) {
+        for (int32_t id = 0; id < nn; ++id) {
+            if (T.feat[id] >= 0) continue;
+            const int32_t r = rep[id];
+            for (int64_t i = T.lo[id]; i < T.hi[id]; ++i) out[idx[i]] = node_value(T, r, X, n, idx[i]);
+        }
+        for (size_t j = 0; j < hold.size(); ++j) out[hold[j]] = node_value(T, rep[leaf_of[j]], X, n, hold[j]);
+        return;
+    }
     for (int32_t id = 0; id < nn; ++id) {
         if (T.feat[id] >= 0) continue;
         const double* v = T.val.data() + (size_t)rep[id] * K;
@@ -927,6 +1108,8 @@ void export_member_safe(const GrownTree& T, int K, const std::vector<uint8_t>* c
                         Tree& out, int32_t base_id, int32_t variant)
 {
     out.base_id = base_id; out.variant = variant; out.nout = K;
+    out.lin_cnt.clear(); out.lin_start.clear(); out.lin_feat.clear(); out.lin_coef.clear();
+    const bool linear = !T.lin_cnt.empty();
     out.feat.clear(); out.thr.clear(); out.left.clear();
     out.right.clear(); out.val.clear(); out.gain.clear();
     // pass 1: pre-order list of kept nodes + mapping
@@ -948,6 +1131,17 @@ void export_member_safe(const GrownTree& T, int K, const std::vector<uint8_t>* c
         const int32_t src = order[i];
         const bool leaf = (T.feat[src] < 0) || (collapsed && (*collapsed)[src]);
         for (int k = 0; k < K; ++k) out.val[(size_t)i * K + k] = T.val[(size_t)src * K + k];
+        if (linear) {
+            if (out.lin_cnt.empty()) { out.lin_cnt.assign(nn, 0); out.lin_start.assign(nn, -1); }
+            if (leaf && T.lin_cnt[src]) {
+                out.lin_cnt[i] = T.lin_cnt[src];
+                out.lin_start[i] = (int32_t)out.lin_feat.size();
+                for (int j = 0; j < (int)T.lin_cnt[src]; ++j) {
+                    out.lin_feat.push_back(T.lin_feat[(size_t)T.lin_start[src] + j]);
+                    out.lin_coef.push_back(T.lin_coef[(size_t)T.lin_start[src] + j]);
+                }
+            }
+        }
         if (leaf) {
             out.feat[i] = -1; out.thr[i] = 0;
             out.left[i] = out.right[i] = -1; out.gain[i] = 0.0; ++leaves;
@@ -975,7 +1169,10 @@ inline const double* predict_leaf(const Tree& T, const uint8_t* X, int64_t n, in
     return T.val.data() + (size_t)id * T.nout;
 }
 inline double predict_row(const Tree& T, const uint8_t* X, int64_t n, int64_t r) {
-    return predict_leaf(T, X, n, r)[0];
+    int32_t id = 0;
+    while (T.feat[id] >= 0)
+        id = (X[(int64_t)T.feat[id] * n + r] <= T.thr[id]) ? T.left[id] : T.right[id];
+    return node_value(T, id, X, n, r);
 }
 
 // ---------------------------------------------------------------------------
@@ -1097,8 +1294,18 @@ public:
     // Each tree emits ONE member: itself, pruned on its own holdout at a
     // per-tree random strength.  The sparse weight fit happens once, in
     // Python, over the whole dictionary afterwards.
+    // holdout_folds > 0 selects out-of-batch holdouts: every batch partitions
+    // the training rows into that many folds, tree t grows on all folds but
+    // fold t mod F and prunes on that fold, so each row is a holdout row for
+    // B/F of the batch's trees and each tree sees (F-1)/F of the data.
+    // 0 keeps the per-tree random subsample of `sub_lo..sub_hi`.
+    //
+    // oob_idx lists training rows whose out-of-batch predictions are wanted:
+    // the returned matrix holds, per row and batch, the mean prediction of the
+    // trees that held that row out -- an honest design for the weight fit.
     py::tuple boost(const ArrU8F& Xa, const ArrF64& ya,
                     const ArrU8F& Xva, const ArrF64& yva,
+                    int holdout_folds, const ArrI32& oob_idx,
                     int batch, int max_batches, double shrink, int patience, double tol,
                     int n_thresh, int argmax_bins, int max_leaves,
                     double sub_lo, double sub_hi,
@@ -1106,9 +1313,17 @@ public:
                     int leaf_lo, int leaf_hi,
                     double feat_lo, double feat_hi,
                     double lam_lo, double lam_hi,
-                    double leaf_shrink, int hist_bits,
+                    double leaf_shrink, int hist_bits, double leaf_l2, int loss,
+                    int linear_feats, double linear_lambda,
                     int hybrid_min, uint64_t seed, int n_jobs)
     {
+        if (linear_feats < 0 || linear_feats > 255) throw std::invalid_argument("linear_leaves must be in [0, 255]");
+        if (linear_lambda <= 0.0 && linear_feats > 0) throw std::invalid_argument("linear_lambda must be > 0");
+        if (leaf_l2 < 0.0) throw std::invalid_argument("leaf_l2 must be >= 0");
+        if (loss < 0 || loss > 1) throw std::invalid_argument("loss must be 0 (squared) or 1 (logistic)");
+        if (holdout_folds < 0) throw std::invalid_argument("holdout_folds must be >= 0");
+        const int nF = holdout_folds > 0 ? std::min(holdout_folds, batch) : 0;
+        if (nF == 1) throw std::invalid_argument("holdout_folds must be 0 or >= 2");
         if (hist_bits < 0 || hist_bits > 15)
             throw std::invalid_argument("hist_bits must be 0 (exact) or in [1, 15]");
         if (Xa.ndim() != 2 || Xva.ndim() != 2)
@@ -1142,8 +1357,52 @@ public:
 
         std::vector<double> r(ya.data(), ya.data() + (size_t)n * K);  // residual (training target)
         std::vector<double> Fv((size_t)nv * K, 0.0);          // generation-ensemble val preds
+        // Logistic loss: trees are grown on the gradient y - p of the
+        // log-likelihood at the current logit F (sigmoid for K == 1, softmax
+        // otherwise), leaves take the Newton step sum(g)/(sum(h)+l2) with
+        // h = p(1-p), and early stopping watches the validation deviance.
+        // F starts at zero; the weight fit's intercept absorbs the base rate.
+        const bool logistic = loss == 1;
+        std::vector<double> F, hrow;
+        const double* y0 = ya.data();
+        auto activate = [&](const double* f, double* pout, int64_t rows) {
+            if (K == 1) {
+                for (int64_t i = 0; i < rows; ++i) pout[i] = 1.0 / (1.0 + std::exp(-f[i]));
+            } else {
+                for (int64_t i = 0; i < rows; ++i) {
+                    double mx = -1e300;
+                    for (int k = 0; k < K; ++k) mx = std::max(mx, f[i * K + k]);
+                    double z = 0.0;
+                    for (int k = 0; k < K; ++k) { pout[i * K + k] = std::exp(f[i * K + k] - mx); z += pout[i * K + k]; }
+                    for (int k = 0; k < K; ++k) pout[i * K + k] /= z;
+                }
+            }
+        };
+        if (logistic) {
+            F.assign((size_t)n * K, 0.0);
+            hrow.assign((size_t)n * K, 0.0);
+            std::vector<double> pr((size_t)n * K);
+            activate(F.data(), pr.data(), n);
+            for (size_t i = 0; i < pr.size(); ++i) { r[i] = y0[i] - pr[i]; hrow[i] = pr[i] * (1.0 - pr[i]); }
+        }
         std::vector<double> bt((size_t)batch * (size_t)n * K);   // per-tree train predictions
         std::vector<double> bv((size_t)batch * (size_t)nv * K);  // per-tree val predictions
+
+        // out-of-batch design: per batch one column of n_oob*K values
+        std::vector<int32_t> oob_pos;  // train row -> position in oob_idx, or -1
+        int64_t n_oob = 0;
+        if (nF > 0 && oob_idx.ndim() == 1 && oob_idx.shape(0) > 0) {
+            oob_pos.assign((size_t)n, -1);
+            auto oi = oob_idx.unchecked<1>();
+            for (py::ssize_t j = 0; j < oi.shape(0); ++j) {
+                if (oi(j) < 0 || oi(j) >= n) throw std::out_of_range("oob_idx out of range");
+                oob_pos[(size_t)oi(j)] = (int32_t)j;
+            }
+            n_oob = oi.shape(0);
+        }
+        std::vector<std::vector<float>> oob_cols;   // [batch][pos*K + k]
+        std::vector<int32_t> fold_of((size_t)(nF > 0 ? n : 0));
+        std::vector<int32_t> oob_cnt((size_t)n_oob);
 
         double best = 1e300;
         int bad = 0, n_batches = 0;
@@ -1162,6 +1421,20 @@ public:
             for (int b = 0; b < max_batches; ++b) {
                 const size_t offset = members.size();
                 members.resize(offset + (size_t)batch);
+                if (nF > 0) {
+                    // a fresh balanced partition each batch, from a stream
+                    // keyed by the batch index so no thread order enters it
+                    std::mt19937_64 frng(splitmix64(seed ^ 0x5DEECE66DULL) + 0x9E3779B97F4A7C15ULL * (uint64_t)(b + 1));
+                    for (int64_t i = 0; i < n; ++i) fold_of[(size_t)i] = (int32_t)(i % nF);
+                    for (int64_t i = n - 1; i > 0; --i) {
+                        std::uniform_int_distribution<int64_t> pick(0, i);
+                        std::swap(fold_of[(size_t)i], fold_of[(size_t)pick(frng)]);
+                    }
+                    if (n_oob > 0) {
+                        oob_cols.emplace_back((size_t)n_oob * K, 0.0f);
+                        std::fill(oob_cnt.begin(), oob_cnt.end(), 0);
+                    }
+                }
                 if (quant) {
                     double amax = 0.0;
                     for (size_t i = 0; i < r.size(); ++i) amax = std::max(amax, std::fabs(r[i]));
@@ -1189,28 +1462,41 @@ public:
                     tp.K = std::max(1, (int)std::lround((feat_lo + U(ws.rng) * (feat_hi - feat_lo)) * p));
                     tp.n_thresh = n_thresh;
                     tp.argmax_bins = argmax_bins;
+                    tp.leaf_l2 = leaf_l2;
 
-                    const double rate = sub_lo + U(ws.rng) * (sub_hi - sub_lo);
-                    // clamp to [1, n]: a zero-row subsample would divide by zero
-                    // in the node mean. Only reachable on very small inputs.
-                    const int64_t msub = std::min<int64_t>(
-                        n, std::max<int64_t>(1, (int64_t)std::llround(rate * (double)n)));
-                    std::vector<int64_t> all((size_t)n);
-                    for (int64_t i = 0; i < n; ++i) all[(size_t)i] = i;
-                    for (int64_t i = 0; i < msub; ++i) {
-                        std::uniform_int_distribution<int64_t> pick(i, n - 1);
-                        std::swap(all[(size_t)i], all[(size_t)pick(ws.rng)]);
+                    std::vector<int64_t> hold;
+                    int64_t msub;
+                    if (nF > 0) {
+                        // out-of-batch holdout: this tree's fold
+                        const int32_t myfold = t % nF;
+                        ws.idx.clear(); hold.clear();
+                        for (int64_t i = 0; i < n; ++i)
+                            (fold_of[(size_t)i] == myfold ? hold : ws.idx).push_back(i);
+                        if (ws.idx.empty()) { ws.idx.push_back(hold.back()); hold.pop_back(); }
+                        msub = (int64_t)ws.idx.size();
+                    } else {
+                        const double rate = sub_lo + U(ws.rng) * (sub_hi - sub_lo);
+                        // clamp to [1, n]: a zero-row subsample would divide by zero
+                        // in the node mean. Only reachable on very small inputs.
+                        msub = std::min<int64_t>(
+                            n, std::max<int64_t>(1, (int64_t)std::llround(rate * (double)n)));
+                        std::vector<int64_t> all((size_t)n);
+                        for (int64_t i = 0; i < n; ++i) all[(size_t)i] = i;
+                        for (int64_t i = 0; i < msub; ++i) {
+                            std::uniform_int_distribution<int64_t> pick(i, n - 1);
+                            std::swap(all[(size_t)i], all[(size_t)pick(ws.rng)]);
+                        }
+                        // Sorted row ids, kept sorted by stable partitions below:
+                        // every histogram fill and holdout route then gathers
+                        // X[f*n + idx] in increasing address order, which the
+                        // prefetcher can follow. The row set is the same; only
+                        // the order the sums are folded in changes, and that
+                        // order is fixed by the data, not by the thread count.
+                        ws.idx.assign(all.begin(), all.begin() + msub);
+                        std::sort(ws.idx.begin(), ws.idx.end());
+                        hold.assign(all.begin() + msub, all.end());
+                        std::sort(hold.begin(), hold.end());
                     }
-                    // Sorted row ids, kept sorted by stable partitions below:
-                    // every histogram fill and holdout route then gathers
-                    // X[f*n + idx] in increasing address order, which the
-                    // prefetcher can follow. The row set is the same; only
-                    // the order the sums are folded in changes, and that
-                    // order is fixed by the data, not by the thread count.
-                    ws.idx.assign(all.begin(), all.begin() + msub);
-                    std::sort(ws.idx.begin(), ws.idx.end());
-                    std::vector<int64_t> hold(all.begin() + msub, all.end());
-                    std::sort(hold.begin(), hold.end());
 
                     if (quant) {
                         // drawn after every hyperparameter so those stay put
@@ -1255,26 +1541,58 @@ public:
                         const double lam = std::exp(std::log(lam_lo) +
                             U(ws.rng) * (std::log(lam_hi) - std::log(lam_lo)));
                         prune_flags(G, K, lam, varh, collapsed, leaves);
-                        if (leaf_shrink >= 0.0) shrink_leaves(G, K, &collapsed, leaf_shrink);
-                        export_member_safe(G, K, &collapsed, M, b * batch + t, 2);
                         exported_leaf_of(G, &collapsed, rep);
+                        if (logistic) newton_refit(G, K, rep, ws.idx, r.data(), hrow.data(), leaf_l2);
+                        if (leaf_shrink >= 0.0) shrink_leaves(G, K, &collapsed, leaf_shrink);
+                        if (linear_feats > 0 && K == 1 && !logistic)
+                            fit_linear_leaves(G, rep, ws.idx, X, n, r.data(), linear_feats, linear_lambda);
+                        export_member_safe(G, K, &collapsed, M, b * batch + t, 2);
                     } else {
-                        export_member_safe(G, K, nullptr, M, b * batch + t, 0);
                         exported_leaf_of(G, nullptr, rep);
+                        if (logistic) newton_refit(G, K, rep, ws.idx, r.data(), hrow.data(), leaf_l2);
+                        if (linear_feats > 0 && K == 1 && !logistic)
+                            fit_linear_leaves(G, rep, ws.idx, X, n, r.data(), linear_feats, linear_lambda);
+                        export_member_safe(G, K, nullptr, M, b * batch + t, 0);
                     }
 
                     // this tree's predictions on train rows come from the leaf
                     // ranges; only the val rows need a walk
                     double* pt = bt.data() + (size_t)t * (size_t)n * K;
-                    predict_train_from_ranges(G, K, rep, ws.idx, hold, leaf_of, pt);
+                    predict_train_from_ranges(G, K, rep, ws.idx, hold, leaf_of, pt, X, n);
                     double* pv = bv.data() + (size_t)t * (size_t)nv * K;
-                    for (int64_t i = 0; i < nv; ++i) {
-                        const double* lv = predict_leaf(M, Xv, nv, i);
-                        for (int k = 0; k < K; ++k) pv[i * K + k] = lv[k];
+                    if (K == 1) {
+                        for (int64_t i = 0; i < nv; ++i) pv[i] = predict_row(M, Xv, nv, i);
+                    } else {
+                        for (int64_t i = 0; i < nv; ++i) {
+                            const double* lv = predict_leaf(M, Xv, nv, i);
+                            for (int k = 0; k < K; ++k) pv[i * K + k] = lv[k];
+                        }
                     }
                 });
 
                 ++n_batches;
+                if (nF > 0 && n_oob > 0) {
+                    // mean of the holdout trees' predictions per oob row: tree
+                    // t held out fold t mod F, so the trees are known from the
+                    // fold table without any per-tree list
+                    std::vector<float>& col = oob_cols.back();
+                    for (int64_t i = 0; i < n; ++i) {
+                        const int32_t pos = oob_pos[(size_t)i];
+                        if (pos < 0) continue;
+                        const int32_t f = fold_of[(size_t)i];
+                        int cnt = 0;
+                        for (int t = f; t < batch; t += nF) {
+                            const double* pt = bt.data() + (size_t)t * (size_t)n * K;
+                            for (int k = 0; k < K; ++k) col[(size_t)pos * K + k] += (float)pt[i * K + k];
+                            ++cnt;
+                        }
+                        oob_cnt[(size_t)pos] = cnt;
+                    }
+                    for (int64_t pos = 0; pos < n_oob; ++pos) {
+                        const float c = (float)std::max(1, oob_cnt[(size_t)pos]);
+                        for (int k = 0; k < K; ++k) col[(size_t)pos * K + k] /= c;
+                    }
+                }
                 const double step = shrink / (double)batch;
                 // Each row folds the batch's trees in the same fixed order
                 // whichever thread owns it, so the result does not depend on
@@ -1285,9 +1603,24 @@ public:
                     pool.run(nc_tr + nc_v, [&](int64_t c) {
                         if (c < nc_tr) {
                             const int64_t lo = c * chunk * K, hi = std::min(n * K, lo + chunk * K);
-                            for (int t = 0; t < batch; ++t) {
-                                const double* pt = bt.data() + (size_t)t * (size_t)n * K;
-                                for (int64_t i = lo; i < hi; ++i) r[(size_t)i] -= step * pt[i];
+                            if (!logistic) {
+                                for (int t = 0; t < batch; ++t) {
+                                    const double* pt = bt.data() + (size_t)t * (size_t)n * K;
+                                    for (int64_t i = lo; i < hi; ++i) r[(size_t)i] -= step * pt[i];
+                                }
+                            } else {
+                                for (int t = 0; t < batch; ++t) {
+                                    const double* pt = bt.data() + (size_t)t * (size_t)n * K;
+                                    for (int64_t i = lo; i < hi; ++i) F[(size_t)i] += step * pt[i];
+                                }
+                                const int64_t rlo = lo / K, rhi = hi / K;
+                                std::vector<double> pr((size_t)(rhi - rlo) * K);
+                                activate(F.data() + rlo * K, pr.data(), rhi - rlo);
+                                for (int64_t i = lo; i < hi; ++i) {
+                                    const double pi = pr[(size_t)(i - lo)];
+                                    r[(size_t)i] = y0[i] - pi;
+                                    hrow[(size_t)i] = pi * (1.0 - pi);
+                                }
                             }
                         } else {
                             const int64_t lo = (c - nc_tr) * chunk * K, hi = std::min(nv * K, lo + chunk * K);
@@ -1299,9 +1632,20 @@ public:
                     });
                 }
                 double mse = 0.0;
-                for (int64_t i = 0; i < nv * K; ++i) {
-                    const double e = yv[i] - Fv[(size_t)i];
-                    mse += e * e;
+                if (!logistic) {
+                    for (int64_t i = 0; i < nv * K; ++i) {
+                        const double e = yv[i] - Fv[(size_t)i];
+                        mse += e * e;
+                    }
+                } else {
+                    // validation deviance in place of the MSE
+                    std::vector<double> pv((size_t)nv * K);
+                    activate(Fv.data(), pv.data(), nv);
+                    for (int64_t i = 0; i < nv * K; ++i) {
+                        const double pi = std::min(1.0 - 1e-12, std::max(1e-12, pv[(size_t)i]));
+                        if (K == 1) mse -= yv[i] * std::log(pi) + (1.0 - yv[i]) * std::log(1.0 - pi);
+                        else mse -= yv[i] * std::log(pi);
+                    }
                 }
                 mse /= (double)nv;
                 if (mse < best - tol) { best = mse; bad = 0; }
@@ -1310,7 +1654,15 @@ public:
         }
         n_features = p;
         n_out = K;
-        return py::make_tuple((int)members.size(), n_batches);
+        ArrF64 oob({(py::ssize_t)(n_oob * K), (py::ssize_t)oob_cols.size()});
+        if (n_oob > 0) {
+            double* o = oob.mutable_data();
+            const int64_t nb = (int64_t)oob_cols.size();
+            for (int64_t b = 0; b < nb; ++b)
+                for (int64_t r = 0; r < n_oob * K; ++r)
+                    o[r * nb + b] = (double)oob_cols[(size_t)b][(size_t)r];
+        }
+        return py::make_tuple((int)members.size(), n_batches, oob);
     }
 
     // -- prediction ---------------------------------------------------------
@@ -1332,6 +1684,10 @@ public:
             ThreadPool pool(resolve_threads(n_jobs) - 1);
             pool.run(m, [&](int64_t j) {
                 const Tree& T = members[(size_t)idx[(size_t)j]];
+                if (K == 1) {
+                    for (int64_t r = 0; r < n; ++r) o[r * (int64_t)m + j] = predict_row(T, X, n, r);
+                    return;
+                }
                 for (int64_t r = 0; r < n; ++r) {
                     const double* lv = predict_leaf(T, X, n, r);
                     for (int k = 0; k < K; ++k) o[(r * K + k) * (int64_t)m + j] = lv[k];
@@ -1363,6 +1719,12 @@ public:
                 std::vector<double> acc((size_t)K);
                 for (int64_t r = 0; r < n; ++r) {
                     for (int k = 0; k < K; ++k) acc[k] = 0.0;
+                    if (K == 1) {
+                        for (int t = 0; t < batch; ++t)
+                            acc[0] += predict_row(members[(size_t)(b * batch + t)], X, n, r);
+                        o[r * (int64_t)nb + b] = acc[0] / (double)batch;
+                        continue;
+                    }
                     for (int t = 0; t < batch; ++t) {
                         const double* lv = predict_leaf(members[(size_t)(b * batch + t)], X, n, r);
                         for (int k = 0; k < K; ++k) acc[k] += lv[k];
@@ -1405,6 +1767,11 @@ public:
                 for (int64_t r = lo; r < hi; ++r) {
                     double* orow = o + r * K;
                     for (int k = 0; k < K; ++k) orow[k] = intercept;
+                    if (K == 1) {
+                        for (int j = 0; j < m; ++j)
+                            orow[0] += w[j] * predict_row(members[(size_t)idx[(size_t)j]], X, n, r);
+                        continue;
+                    }
                     for (int j = 0; j < m; ++j) {
                         const double* lv = predict_leaf(members[(size_t)idx[(size_t)j]], X, n, r);
                         for (int k = 0; k < K; ++k) orow[k] += w[j] * lv[k];
@@ -1483,6 +1850,11 @@ public:
                     throw std::runtime_error("model references a feature index beyond n_features");
                 o[f] = true;
             }
+            for (int32_t f : T.lin_feat) {
+                if (f < 0 || f >= n_features_out)
+                    throw std::runtime_error("model references a feature index beyond n_features");
+                o[f] = true;
+            }
         }
         return out;
     }
@@ -1525,8 +1897,21 @@ public:
                 for (int k = 0; k < K; ++k)
                     T.val[i * K + k] = T.leaf_a + T.leaf_b * (double)leaf_code(T, T.val[i * K + k]);
             }
+            if (!T.lin_coef.empty()) {
+                double clo = 1e300, chi = -1e300;
+                for (double c : T.lin_coef) { clo = std::min(clo, c); chi = std::max(chi, c); }
+                T.lin_a = clo;
+                T.lin_b = (chi > clo) ? (chi - clo) / 65535.0 : 0.0;
+                for (double& c : T.lin_coef) c = T.lin_a + T.lin_b * (double)coef_code(T, c);
+            }
             T.quantized = true;
         }
+    }
+
+    static uint16_t coef_code(const Tree& T, double v) {
+        if (T.lin_b <= 0.0) return 0;
+        double q = std::nearbyint((v - T.lin_a) / T.lin_b);
+        return (uint16_t)std::min(65535.0, std::max(0.0, q));
     }
 
     static uint16_t leaf_code(const Tree& T, double v) {
@@ -1555,6 +1940,13 @@ public:
                 if (f >= n_features_out)
                     throw std::runtime_error("model references a feature index beyond n_features");
                 o[(size_t)f * 256 + T.thr[k]] = true;
+            }
+            // a linear leaf reads the bin id itself, so every edge of that
+            // feature has to travel
+            for (int32_t f : T.lin_feat) {
+                if (f < 0 || f >= n_features_out)
+                    throw std::runtime_error("model references a feature index beyond n_features");
+                for (int t = 0; t < 256; ++t) o[(size_t)f * 256 + t] = true;
             }
         }
         return out;
@@ -1618,6 +2010,23 @@ public:
                     if (n_out > 1) put(buf, (uint8_t)code); else put(buf, code);
                 }
             }
+            // linear leaves: a flag, the coefficient map, then per leaf a
+            // count and (feature, coefficient code) pairs
+            const uint8_t linear = T.lin_coef.empty() ? 0 : 1;
+            put(buf, linear);
+            if (linear) {
+                put(buf, T.lin_a); put(buf, T.lin_b);
+                for (size_t i = 0; i < nn; ++i) {
+                    if (T.feat[i] >= 0) continue;
+                    const uint8_t c = T.lin_cnt[i];
+                    put(buf, c);
+                    for (int j = 0; j < (int)c; ++j) {
+                        const size_t k = (size_t)T.lin_start[i] + j;
+                        if (nf16) put(buf, (uint16_t)T.lin_feat[k]); else put(buf, T.lin_feat[k]);
+                        put(buf, coef_code(T, T.lin_coef[k]));
+                    }
+                }
+            }
         }
         return py::bytes(buf);
     }
@@ -1633,6 +2042,9 @@ public:
             total += 4 + 4 + 4 + 4 + 8 + 8 + (int64_t)bitmap_bytes(nn);
             total += (int64_t)(nn - (size_t)T.n_leaves) * (fw + 1 + rw);
             total += (int64_t)T.n_leaves * (n_out > 1 ? 1 : 2) * n_out;
+            total += 1;  // linear flag
+            if (!T.lin_coef.empty())
+                total += 16 + (int64_t)T.n_leaves + (int64_t)T.lin_coef.size() * (fw + 2);
         }
         return total;
     }
@@ -1703,6 +2115,23 @@ public:
                         const double code = K > 1 ? (double)rd.get<uint8_t>() : (double)rd.get<uint16_t>();
                         T.val[k * K + c] = T.leaf_a + T.leaf_b * code;
                     }
+            if (rd.get<uint8_t>()) {
+                T.lin_a = rd.get<double>(); T.lin_b = rd.get<double>();
+                T.lin_cnt.assign(nn, 0); T.lin_start.assign(nn, -1);
+                for (size_t k = 0; k < nn; ++k) {
+                    if (T.feat[k] >= 0) continue;
+                    const uint8_t c = rd.get<uint8_t>();
+                    if (!c) continue;
+                    T.lin_cnt[k] = c; T.lin_start[k] = (int32_t)T.lin_feat.size();
+                    for (int j = 0; j < (int)c; ++j) {
+                        const int32_t f = nf16 ? (int32_t)rd.get<uint16_t>() : rd.get<int32_t>();
+                        if (out.n_features >= 0 && (f < 0 || f >= out.n_features))
+                            throw std::runtime_error("SXE: feature index out of range in model blob");
+                        T.lin_feat.push_back(f);
+                        T.lin_coef.push_back(T.lin_a + T.lin_b * (double)rd.get<uint16_t>());
+                    }
+                }
+            }
         }
         return out;
     }
@@ -1724,6 +2153,7 @@ PYBIND11_MODULE(_core, m) {
         .def_property_readonly("n_members", &Ensemble::n_members)
         .def("boost", &Ensemble::boost,
              py::arg("X"), py::arg("y"), py::arg("X_val"), py::arg("y_val"),
+             py::arg("holdout_folds"), py::arg("oob_idx"),
              py::arg("batch"), py::arg("max_batches"), py::arg("shrink"),
              py::arg("patience"), py::arg("tol"),
              py::arg("n_thresh"), py::arg("argmax_bins"), py::arg("max_leaves"),
@@ -1732,9 +2162,10 @@ PYBIND11_MODULE(_core, m) {
              py::arg("leaf_lo"), py::arg("leaf_hi"),
              py::arg("feat_lo"), py::arg("feat_hi"),
              py::arg("lam_lo"), py::arg("lam_hi"),
-             py::arg("leaf_shrink"), py::arg("hist_bits"),
+             py::arg("leaf_shrink"), py::arg("hist_bits"), py::arg("leaf_l2"), py::arg("loss"),
+             py::arg("linear_feats"), py::arg("linear_lambda"),
              py::arg("hybrid_min"), py::arg("seed"), py::arg("n_jobs"),
-             "Grow the batch-boosted dictionary. Returns (n_members, n_batches).")
+             "Grow the batch-boosted dictionary. Returns (n_members, n_batches, oob_design).")
         .def("predict_members", &Ensemble::predict_members,
              py::arg("X"), py::arg("members"), py::arg("n_jobs") = -1)
         .def("predict_batch_means", &Ensemble::predict_batch_means,

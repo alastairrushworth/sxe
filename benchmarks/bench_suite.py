@@ -193,7 +193,7 @@ DATASETS = {
         loader=load_california,
         seeds=5,
         budget=24,
-        cap=400,
+        cap=1500,
         threads=(1, -1),
         note="smooth low-dimensional signal, small n",
     ),
@@ -201,7 +201,7 @@ DATASETS = {
         loader=load_friedman1,
         seeds=5,
         budget=24,
-        cap=250,
+        cap=600,
         threads=(1, -1),
         note="known signal buried in 20 noise features",
     ),
@@ -209,7 +209,7 @@ DATASETS = {
         loader=load_superconduct,
         seeds=5,
         budget=24,
-        cap=250,
+        cap=600,
         threads=(1, -1),
         note="real regression, 81 correlated features",
     ),
@@ -217,7 +217,7 @@ DATASETS = {
         loader=load_covtype_binary,
         seeds=5,
         budget=24,
-        cap=250,
+        cap=600,
         threads=(1, -1),
         note="the original reference point, 30k subsample",
     ),
@@ -225,7 +225,7 @@ DATASETS = {
         loader=load_covtype_full,
         seeds=3,
         budget=10,
-        cap=200,
+        cap=600,
         threads=(-1,),
         note="large n: 581k rows, where gradient-boosting scaling shows",
     ),
@@ -233,7 +233,7 @@ DATASETS = {
         loader=load_adult,
         seeds=5,
         budget=24,
-        cap=250,
+        cap=600,
         threads=(1, -1),
         note="mixed-cardinality categoricals (2-41), missing values in them",
     ),
@@ -241,7 +241,7 @@ DATASETS = {
         loader=load_bank_marketing,
         seeds=5,
         budget=24,
-        cap=250,
+        cap=600,
         threads=(1, -1),
         note="categoricals (2-12), no missing values",
     ),
@@ -249,7 +249,7 @@ DATASETS = {
         loader=load_letter,
         seeds=3,
         budget=16,
-        cap=150,
+        cap=300,
         threads=(-1,),
         note="26 classes: the cost of the one-vs-rest reduction",
     ),
@@ -257,7 +257,7 @@ DATASETS = {
         loader=load_madelon,
         seeds=5,
         budget=24,
-        cap=250,
+        cap=600,
         threads=(1, -1),
         note="p >> n: 500 features, 2600 rows, mostly noise",
     ),
@@ -275,6 +275,7 @@ TUNED_SXE = {
         max_iter=1200,
         n_iter_no_change=25,
         min_samples_leaf_range=(10, 25),
+        holdout="random",
         subsample_range=(0.9, 1.0),
         max_features_range=(0.85, 1.0),
         validation_fraction=0.15,
@@ -288,6 +289,7 @@ TUNED_SXE = {
         n_iter_no_change=2,
         max_depth_choices=(4, 5, 6),
         min_samples_leaf_range=(20, 70),
+        holdout="random",
         subsample_range=(0.2, 0.35),
         max_features_range=(0.35, 0.65),
         validation_fraction=0.10,
@@ -300,6 +302,7 @@ TUNED_SXE = {
         learning_rate=0.25,
         batch_size=12,
         max_iter=50,
+        holdout="random",
         subsample_range=(0.5, 0.8),
         n_iter_no_change=5,
         validation_fraction=0.15,
@@ -439,12 +442,15 @@ LGBM_SPACE = dict(
 )
 
 SXE_DEPTHS = [(4, 5, 6), (6, 7, 8), (8, 10, 12), (10, 12, 14), (0,)]
-SXE_LEAVES = [(2, 15), (5, 30), (10, 60), (20, 70)]
-SXE_SUBSAMPLE = [(0.2, 0.35), (0.4, 0.75), (0.5, 0.8), (0.9, 1.0)]
+SXE_LEAVES = [(2, 15), (3, 20), (5, 30), (10, 60), (20, 70)]
+# holdout design: out-of-batch folds (each tree sees 3/4 or 7/8 of the rows)
+# or the older per-tree random subsample at one of these rates
+SXE_HOLDOUT = [("batch", 8), ("batch", 8), ("batch", 4), ("random", (0.4, 0.75)),
+               ("random", (0.5, 0.8)), ("random", (0.9, 1.0))]
 SXE_FEATURES = [(0.35, 0.65), (0.5, 1.0), (0.85, 1.0)]
 SXE_PRUNE = [(1e-3, 0.05), (1e-3, 1.0), (1e-2, 2.0)]
 SXE_SPLITTERS = [("best", 2), ("random", 2), ("random", 3)]
-SXE_LEAFWISE = [None, None, 31, 63, 127]  # None twice: depth-wise is the default shape
+SXE_LEAFWISE = [None, None, 31, 63, 127, 255, 511]  # None twice: depth-wise is the default shape
 
 
 def _logu(rng, lo, hi):
@@ -476,17 +482,21 @@ def sample_sxe(rng, cap, n_binary):
     that stop at the same place.
     """
     params = dict(
-        learning_rate=_logu(rng, 0.03, 0.4),
+        learning_rate=_logu(rng, 0.01, 0.4),
         batch_size=int(_pick(rng, [4, 8, 12, 16])),
         max_iter=int(cap),
-        n_iter_no_change=int(_pick(rng, [3, 8, 20])),
+        n_iter_no_change=int(_pick(rng, [3, 8, 20, 40])),
         min_samples_leaf_range=_pick(rng, SXE_LEAVES),
-        subsample_range=_pick(rng, SXE_SUBSAMPLE),
         max_features_range=_pick(rng, SXE_FEATURES),
         prune_strength_range=_pick(rng, SXE_PRUNE),
         validation_fraction=float(_pick(rng, [0.10, 0.15, 0.18])),
     )
     params["splitter"], params["n_thresholds"] = _pick(rng, SXE_SPLITTERS)
+    mode, arg = _pick(rng, SXE_HOLDOUT)
+    if mode == "batch":
+        params["holdout"], params["holdout_folds"] = "batch", int(arg)
+    else:
+        params["holdout"], params["subsample_range"] = "random", tuple(arg)
     leafwise = _pick(rng, SXE_LEAFWISE)
     if leafwise is None:
         params["max_depth_choices"] = _pick(rng, SXE_DEPTHS)
