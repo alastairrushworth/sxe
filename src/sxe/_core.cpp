@@ -187,6 +187,7 @@ struct Tree {
     int32_t n_leaves = 0;
     int32_t base_id = -1;   // which grown tree this member came from
     int32_t variant = 0;    // 0 raw, 2 random lambda
+    int32_t stratum = 0;    // which depth choice this tree drew
     // Leaf values ship as 16-bit codes: val = leaf_a + leaf_b * q. Set by
     // quantize_leaves(), which also rounds `val` in place so the model in
     // memory is the model on disk.
@@ -1103,10 +1104,14 @@ void predict_train_from_ranges(const GrownTree& T, int K, const std::vector<int3
 // bottom-up collapse decision; pre-order ids => descending id is bottom-up.
 // returns per-node "collapsed" flags for penalty lambda (in units of holdout
 // variance per extra leaf).
-void prune_flags(const GrownTree& T, int K, double lam, double varh,
+// Returns the pruned tree's holdout SSE and leaf count -- both already
+// computed at the root by the bottom-up pass, and both needed to choose a
+// pruning strength from evidence rather than from a prior.
+std::pair<double, int32_t> prune_flags(const GrownTree& T, int K, double lam, double varh,
                  std::vector<uint8_t>& collapsed, std::vector<int32_t>& leaves)
 {
     const int32_t nn = (int32_t)T.feat.size();
+    if (nn == 0) return {0.0, 0};
     std::vector<double> sse_sub(nn);
     collapsed.assign(nn, 0); leaves.assign(nn, 1);
     for (int32_t id = nn - 1; id >= 0; --id) {
@@ -1120,7 +1125,48 @@ void prune_flags(const GrownTree& T, int K, double lam, double varh,
             sse_sub[id] = child; leaves[id] = lv;
         }
     }
+    return {sse_sub[0], leaves[0]};
 }
+
+constexpr int kPruneGrid = 21;
+
+inline double prune_lambda_at(int j) {
+    // 0 removes only the splits the holdout calls dead; the geometric tail
+    // runs up to a strength that collapses the tree to a stump
+    return j == 0 ? 0.0 : std::exp(std::log(1e-3) +
+           (std::log(1e2) - std::log(1e-3)) * (double)(j - 1) / (double)(kPruneGrid - 2));
+}
+
+// This tree's holdout SSE at every strength on the grid.
+void prune_path(const GrownTree& T, int K, double varh,
+                std::vector<uint8_t>& collapsed, std::vector<int32_t>& leaves, double* sse)
+{
+    for (int j = 0; j < kPruneGrid; ++j)
+        sse[j] = prune_flags(T, K, prune_lambda_at(j), varh, collapsed, leaves).first;
+}
+
+// The pruning strength a batch's pooled evidence supports: the strongest
+// pruning whose summed holdout SSE is within one standard error of the best
+// (Var(SSE) ~ 2 SSE^2 / n for roughly Gaussian residuals).
+//
+// Pooling is what makes this work. A tree choosing for itself picks from 21
+// candidates on its own holdout and scores the winner on those same rows, so
+// the choice is optimistically biased and under-prunes -- measured, worse than
+// drawing the strength at random. Sixteen trees pooling their private
+// holdouts have sixteen times the evidence for the one scalar they share, and
+// because that one strength meets sixteen different subsamples the trees still
+// come out different shapes: the spread of complexities the ensemble needs is
+// preserved rather than collapsed onto a point, which is what sank the
+// per-tree version.
+double pooled_prune_lambda(const double* pooled, double n_hold_total) {
+    double best = 1e300;
+    for (int j = 0; j < kPruneGrid; ++j) best = std::min(best, pooled[j]);
+    const double tol = best * (1.0 + std::sqrt(2.0 / std::max(1.0, n_hold_total)));
+    int chosen = 0;
+    for (int j = 0; j < kPruneGrid; ++j) if (pooled[j] <= tol) chosen = j;  // lambdas ascend
+    return prune_lambda_at(chosen);
+}
+
 
 // Holdout-fitted leaf step size (PaloBoost, Park & Ho 2018, eqs. 12-13).
 // A leaf predicts its training mean mu; the multiplier c that minimises the
@@ -1371,6 +1417,7 @@ public:
                     int linear_feats, double linear_lambda,
                     double feature_power, int leaf_refit_all, int honest_residuals,
                     int config_scope, const std::vector<int>& leaf_choices, int config_search,
+                    int prune_select,
                     int hybrid_min, uint64_t seed, int n_jobs)
     {
         if (config_scope < 0 || config_scope > 2)
@@ -1517,6 +1564,12 @@ public:
         std::vector<int> shape_seen((size_t)std::max(1, n_shapes), 0);
         int cur_shape = 0, shape_round = 0;
         double prev_loss = 0.0;
+        // pruning strength for the current batch, from the previous batch's
+        // pooled evidence: a one-batch lag, so the parallel region needs no
+        // phase split and the residual it is judged against is one step stale
+        double lam_pooled = -1.0;
+        std::vector<double> path_rows((size_t)batch * kPruneGrid, 0.0);
+        std::vector<double> path_hold((size_t)batch, 0.0);
 
         double best = 1e300;
         int bad = 0, n_batches = 0;
@@ -1614,11 +1667,15 @@ public:
                     std::uniform_real_distribution<double> U(0.0, 1.0);
                     TreeParams tp;
                     int tree_leaves = max_leaves;
+                    int stratum = 0;
                     if (cfg_now) {
                         tp.max_depth = cfg_depth; tp.min_leaf = cfg_minleaf; tp.K = cfg_K;
                         tree_leaves = cfg_leaves;
+                        stratum = cur_shape % std::max(1, n_depth);
                     } else {
-                        int d = depth_choices[(int)(U(ws.rng) * n_depth) % n_depth];
+                        const int di = (int)(U(ws.rng) * n_depth) % n_depth;
+                        stratum = di;
+                        int d = depth_choices[di];
                         tp.max_depth = (d <= 0) ? 64 : d;
                         tp.min_leaf = (int)std::lround(std::exp(
                             std::log((double)leaf_lo) +
@@ -1706,10 +1763,18 @@ public:
                     // Small-holdout guard: subtrees the holdout never visits satisfy the
                     // collapse inequality trivially and would prune the tree to a stump.
                     if ((int64_t)hold.size() >= std::max<int64_t>(50, n / 50)) {
-                        const double lam = cfg_now ? cfg_lam
-                            : std::exp(std::log(lam_lo) +
-                                       U(ws.rng) * (std::log(lam_hi) - std::log(lam_lo)));
-                        prune_flags(G, K, lam, varh, collapsed, leaves);
+                        if (prune_select) {
+                            prune_path(G, K, varh, collapsed, leaves,
+                                       path_rows.data() + (size_t)t * kPruneGrid);
+                            path_hold[(size_t)t] = (double)hold.size();
+                            prune_flags(G, K, lam_pooled >= 0.0 ? lam_pooled : 0.0,
+                                        varh, collapsed, leaves);
+                        } else {
+                            const double lam = cfg_now ? cfg_lam
+                                : std::exp(std::log(lam_lo) +
+                                           U(ws.rng) * (std::log(lam_hi) - std::log(lam_lo)));
+                            prune_flags(G, K, lam, varh, collapsed, leaves);
+                        }
                         exported_leaf_of(G, &collapsed, rep);
                         if (logistic) newton_refit(G, K, rep, ws.idx, r.data(), hrow.data(), leaf_l2, leaf_refit_all != 0);
                         else if (leaf_refit_all) mean_refit_all_rows(G, K, rep);
@@ -1726,6 +1791,8 @@ public:
                         export_member_safe(G, K, nullptr, M, b * batch + t, 0);
                     }
 
+                    M.stratum = stratum;
+
                     // this tree's predictions on train rows come from the leaf
                     // ranges; only the val rows need a walk
                     double* pt = bt.data() + (size_t)t * (size_t)n * K;
@@ -1741,6 +1808,18 @@ public:
                     }
                 });
 
+                if (prune_select) {
+                    // reduce in tree order, so the choice cannot depend on
+                    // which thread happened to finish first
+                    double pooled[kPruneGrid] = {0.0};
+                    double nh = 0.0;
+                    for (int t = 0; t < batch; ++t) {
+                        for (int j = 0; j < kPruneGrid; ++j)
+                            pooled[j] += path_rows[(size_t)t * kPruneGrid + j];
+                        nh += path_hold[(size_t)t];
+                    }
+                    if (nh > 0.0) lam_pooled = pooled_prune_lambda(pooled, nh);
+                }
                 ++n_batches;
                 if (weighted) {
                     std::vector<double> share((size_t)p, 0.0);
@@ -1931,6 +2010,65 @@ public:
             });
         }
         return out;
+    }
+
+    // out[i, b*S + s] = mean prediction of the trees of batch b that were
+    // grown at shape stratum s (zero where a batch has none).
+    //
+    // One column per batch forces the shapes inside it to be averaged with
+    // equal weight, so the weight fit can only accept or reject a whole
+    // trajectory step and never says anything about shape. Splitting the
+    // column by stratum lets it weight shapes -- equally where the data does
+    // not separate them, which reproduces the averaged column, or unequally
+    // where it does. The spread of shapes is still grown either way.
+    py::tuple predict_batch_strata(const ArrU8F& Xa, int batch, int n_strata, int n_jobs) {
+        int64_t n; int p;
+        check_matrix(Xa, n, p);
+        if (batch < 1) throw std::invalid_argument("batch_size must be >= 1");
+        if (n_strata < 1) throw std::invalid_argument("n_strata must be >= 1");
+        const int nb = (int)(members.size() / (size_t)batch);
+        if (nb == 0) throw std::invalid_argument("fewer members than batch_size");
+        const int K = n_out, S = n_strata, ncol = nb * S;
+
+        ArrF64 out({(py::ssize_t)(n * K), (py::ssize_t)ncol});
+        py::array_t<int32_t> counts({(py::ssize_t)nb, (py::ssize_t)S});
+        double* o = out.mutable_data();
+        int32_t* cnt = counts.mutable_data();
+        std::fill(cnt, cnt + (size_t)nb * S, 0);
+        for (int b = 0; b < nb; ++b)
+            for (int t = 0; t < batch; ++t) {
+                const int st = members[(size_t)(b * batch + t)].stratum;
+                if (st >= 0 && st < S) cnt[(size_t)b * S + st]++;
+            }
+        const uint8_t* X = Xa.data();
+        {
+            py::gil_scoped_release nogil;
+            ThreadPool pool(resolve_threads(n_jobs) - 1);
+            pool.run(ncol, [&](int64_t c) {
+                const int b = (int)(c / S), st = (int)(c % S);
+                const int32_t m = cnt[(size_t)b * S + st];
+                for (int64_t r = 0; r < n; ++r)
+                    for (int k = 0; k < K; ++k) o[(r * K + k) * (int64_t)ncol + c] = 0.0;
+                if (m == 0) return;
+                for (int t = 0; t < batch; ++t) {
+                    const Tree& T = members[(size_t)(b * batch + t)];
+                    if (T.stratum != st) continue;
+                    for (int64_t r = 0; r < n; ++r) {
+                        if (K == 1) {
+                            o[r * (int64_t)ncol + c] += predict_row(T, X, n, r);
+                        } else {
+                            const double* lv = predict_leaf(T, X, n, r);
+                            for (int k = 0; k < K; ++k)
+                                o[(r * K + k) * (int64_t)ncol + c] += lv[k];
+                        }
+                    }
+                }
+                for (int64_t r = 0; r < n; ++r)
+                    for (int k = 0; k < K; ++k)
+                        o[(r * K + k) * (int64_t)ncol + c] /= (double)m;
+            });
+        }
+        return py::make_tuple(out, counts);
     }
 
     ArrF64 predict_weighted(const ArrU8F& Xa, const ArrI32& mem,
@@ -2180,6 +2318,7 @@ public:
             put(buf, T.n_leaves);
             put(buf, T.base_id);
             put(buf, T.variant);
+            put(buf, T.stratum);
             put(buf, (uint32_t)nn);
             put(buf, T.leaf_a);
             put(buf, T.leaf_b);
@@ -2233,7 +2372,7 @@ public:
         for (const Tree& T : members) {
             const size_t nn = T.feat.size();
             const int64_t rw = narrow_node(nn) ? 2 : 4;
-            total += 4 + 4 + 4 + 4 + 8 + 8 + (int64_t)bitmap_bytes(nn);
+            total += 4 + 4 + 4 + 4 + 4 + 8 + 8 + (int64_t)bitmap_bytes(nn);
             total += (int64_t)(nn - (size_t)T.n_leaves) * (fw + 1 + rw);
             total += (int64_t)T.n_leaves * (n_out > 1 ? 1 : 2) * n_out;
             total += 1;  // linear flag
@@ -2269,6 +2408,7 @@ public:
             T.n_leaves = rd.get<int32_t>();
             T.base_id = rd.get<int32_t>();
             T.variant = rd.get<int32_t>();
+            T.stratum = rd.get<int32_t>();
             const uint32_t nn32 = rd.get<uint32_t>();
             if (nn32 == 0 || nn32 > (uint32_t)INT32_MAX)
                 throw std::runtime_error("SXE: implausible node count in model blob");
@@ -2360,12 +2500,21 @@ PYBIND11_MODULE(_core, m) {
              py::arg("linear_feats"), py::arg("linear_lambda"), py::arg("feature_power"),
              py::arg("leaf_refit_all"), py::arg("honest_residuals"),
              py::arg("config_scope"), py::arg("leaf_choices"), py::arg("config_search"),
+             py::arg("prune_select"),
              py::arg("hybrid_min"), py::arg("seed"), py::arg("n_jobs"),
              "Grow the batch-boosted dictionary. Returns (n_members, n_batches, oob_design).")
         .def("predict_members", &Ensemble::predict_members,
              py::arg("X"), py::arg("members"), py::arg("n_jobs") = -1)
         .def("predict_batch_means", &Ensemble::predict_batch_means,
              py::arg("X"), py::arg("batch"), py::arg("n_jobs") = -1)
+        .def("predict_batch_strata", &Ensemble::predict_batch_strata,
+             py::arg("X"), py::arg("batch"), py::arg("n_strata"), py::arg("n_jobs") = -1,
+             "Per-batch, per-shape-stratum mean predictions and their tree counts.")
+        .def("strata", [](const Ensemble& e) {
+                 std::vector<int32_t> v(e.members.size());
+                 for (size_t i = 0; i < e.members.size(); ++i) v[i] = e.members[i].stratum;
+                 return v;
+             }, "The shape stratum each member was grown at.")
         .def("predict_weighted", &Ensemble::predict_weighted,
              py::arg("X"), py::arg("members"), py::arg("weights"),
              py::arg("intercept"), py::arg("n_jobs") = -1)

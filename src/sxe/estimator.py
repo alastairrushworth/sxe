@@ -178,6 +178,16 @@ class _BaseSXE(BaseEstimator):
         Per-tree row subsample rate under ``holdout="random"``. The
         complement is that tree's pruning holdout, so rates near 1.0 leave
         little to prune against.
+    prune_selection : {"random", "holdout"}, default="random"
+        Where a tree's pruning strength comes from. "random" draws it from
+        ``prune_strength_range``. "holdout" scores the whole pruning path on
+        the tree's own out-of-sample rows and draws uniformly from the
+        strengths that path cannot distinguish from the best one -- so the
+        tree's complexity is decided by evidence where the evidence separates
+        the candidates, and randomized only where it does not. Because a deep
+        tree pruned hard is a shallow tree, this one choice subsumes the
+        depth, leaf-budget and leaf-size axes, and ``prune_strength_range`` is
+        then unused.
     prune_strength_range : tuple of float, default=(1e-3, 1.0)
         Per-tree holdout pruning penalty lambda, sampled log-uniformly.
     leaf_shrinkage : float or None, default=None
@@ -187,6 +197,13 @@ class _BaseSXE(BaseEstimator):
         clipped to [0, 1] -- so a leaf the holdout contradicts is damped and
         one it confirms is kept whole. The value is the strength of the pull
         toward 1 (in holdout rows); 0 is the raw holdout fit. None disables.
+    weight_strata : bool, default=False
+        Give the weight fit one column per (batch, tree shape) instead of one
+        per batch. The trees grown are exactly the same -- the full spread of
+        shapes, as always -- but the fit can now weight shapes unequally where
+        the data separates them and equally where it does not, which is the
+        averaged column it had before. How much it differentiates is then an
+        estimate rather than a setting, reported as ``shape_spread_``.
     config_scope : {"auto", "tree", "batch", "mixed"}, default="auto"
         Whose draw the per-tree settings (depth, leaf budget, leaf floor,
         candidate fraction, pruning strength) come from. "tree" draws one per
@@ -330,6 +347,7 @@ class _BaseSXE(BaseEstimator):
         max_bins=255,
         max_depth_choices=None,
         max_leaf_nodes=None,
+        weight_strata=False,
         config_scope="auto",
         config_search="adaptive",
         min_samples_leaf_range=None,
@@ -338,6 +356,7 @@ class _BaseSXE(BaseEstimator):
         holdout_folds=4,
         subsample_range=(0.4, 0.75),
         prune_strength_range=(1e-3, 1.0),
+        prune_selection="random",
         leaf_shrinkage=None,
         leaf_refit="train",
         honest_residuals=False,
@@ -371,6 +390,7 @@ class _BaseSXE(BaseEstimator):
         self.max_bins = max_bins
         self.max_depth_choices = max_depth_choices
         self.max_leaf_nodes = max_leaf_nodes
+        self.weight_strata = weight_strata
         self.config_scope = config_scope
         self.config_search = config_search
         self.min_samples_leaf_range = min_samples_leaf_range
@@ -379,6 +399,7 @@ class _BaseSXE(BaseEstimator):
         self.holdout_folds = holdout_folds
         self.subsample_range = subsample_range
         self.prune_strength_range = prune_strength_range
+        self.prune_selection = prune_selection
         self.leaf_shrinkage = leaf_shrinkage
         self.leaf_refit = leaf_refit
         self.honest_residuals = honest_residuals
@@ -443,6 +464,10 @@ class _BaseSXE(BaseEstimator):
             raise ValueError(f"splitter must be 'best' or 'random', got {self.splitter!r}")
         if self.n_thresholds < 1:
             raise ValueError(f"n_thresholds must be >= 1, got {self.n_thresholds}")
+        if self.prune_selection not in ("random", "holdout"):
+            raise ValueError(
+                f"prune_selection must be 'random' or 'holdout', got {self.prune_selection!r}"
+            )
         if self.config_search not in ("random", "adaptive"):
             raise ValueError(f"config_search must be 'random' or 'adaptive', got {self.config_search!r}")
         if self.config_scope not in ("auto", "tree", "batch", "mixed"):
@@ -764,6 +789,7 @@ class _BaseSXE(BaseEstimator):
             config_scope={"tree": 0, "batch": 1, "mixed": 2}[scope],
             leaf_choices=list(leaf_choices),
             config_search=1 if self.config_search == "adaptive" else 0,
+            prune_select=1 if self.prune_selection == "holdout" else 0,
             sub_lo=sub[0],
             sub_hi=sub[1],
             depth_choices=[int(d) for d in depths],
@@ -790,9 +816,17 @@ class _BaseSXE(BaseEstimator):
         # becomes independent of the number of trees, and it can drop whole
         # steps of the boosting trajectory.
         t_w = time.perf_counter()
-        Pb = ens.predict_batch_means(Xval, batch, n_jobs)
+        n_strata = len(depths) if self.weight_strata else 1
+        if n_strata > 1:
+            Pb, strat_counts = ens.predict_batch_strata(Xval, batch, n_strata, n_jobs)
+            strat_counts = np.asarray(strat_counts)
+        else:
+            Pb, strat_counts = ens.predict_batch_means(Xval, batch, n_jobs), None
         yflat = np.ascontiguousarray(y_val).ravel()
-        if folds and P_oob.shape[0]:
+        # the out-of-batch design carries one column per batch; a stratified
+        # design has S per batch, so until the core emits stratified
+        # out-of-batch columns those honest rows sit out of this fit
+        if folds and P_oob.shape[0] and n_strata == 1:
             # honest rows from the training fold on top of the validation
             # fold; whole samples shuffled with a fixed permutation, since a
             # K-output sample occupies K consecutive rows the softmax working
@@ -815,18 +849,50 @@ class _BaseSXE(BaseEstimator):
             w_batch, intercept = self._fit_weights(Pb_fit, y_fit)
         weight_time = time.perf_counter() - t_w
 
-        sel_b = np.flatnonzero(w_batch > 1e-10)
-        probe_b = sel_b if sel_b.size else np.array([0], dtype=np.int64)
-        probe = np.ascontiguousarray(
-            (probe_b[:, None] * batch + np.arange(batch)[None, :]).ravel(), dtype=np.int32
-        )
-        w_probe = np.ascontiguousarray(np.repeat(w_batch[probe_b] / batch, batch))
+        probe, w_probe = self._members_for(ens, w_batch, batch, n_strata, strat_counts)
         loss = self._val_loss(ens, probe, w_probe, float(intercept), Xval, y_val, n_jobs)
         return dict(
             ens=ens, n_members=n_members, n_batches=n_batches, Pb=Pb,
             w_batch=w_batch, intercept=float(intercept), weight_time=weight_time,
-            val_loss=loss,
+            val_loss=loss, n_strata=n_strata, strat_counts=strat_counts,
         )
+
+    @staticmethod
+    def _members_for(ens, w_batch, batch, n_strata, strat_counts):
+        """Members carrying a positive weight, and the weight each one gets.
+
+        With one column per batch a surviving column is the whole batch, and
+        its trees share the weight equally. With a column per (batch, shape)
+        it is the trees of that batch grown at that shape, and the weight is
+        divided among however many there were.
+        """
+        if n_strata <= 1:
+            sel_b = np.flatnonzero(w_batch > 1e-10)
+            if sel_b.size == 0:
+                sel_b = np.array([0], dtype=np.int64)
+                w_batch = np.zeros_like(w_batch)
+            sel = (sel_b[:, None] * batch + np.arange(batch)[None, :]).ravel()
+            return (np.ascontiguousarray(sel, dtype=np.int32),
+                    np.ascontiguousarray(np.repeat(w_batch[sel_b] / batch, batch)))
+        strata = np.asarray(ens.strata())
+        keep = np.flatnonzero(w_batch > 1e-10)
+        if keep.size == 0:
+            keep = np.array([0], dtype=np.int64)
+            w_batch = np.zeros_like(w_batch)
+        sel, wts = [], []
+        for col in keep:
+            b, st = int(col) // n_strata, int(col) % n_strata
+            idx = np.arange(b * batch, (b + 1) * batch)
+            idx = idx[strata[idx] == st]
+            if idx.size == 0:
+                continue
+            sel.append(idx)
+            wts.append(np.full(idx.size, w_batch[col] / idx.size))
+        if not sel:
+            idx = np.arange(batch)
+            return (np.ascontiguousarray(idx, dtype=np.int32), np.zeros(batch))
+        return (np.ascontiguousarray(np.concatenate(sel), dtype=np.int32),
+                np.ascontiguousarray(np.concatenate(wts)))
 
     # -- fit -----------------------------------------------------------------
     def _fit(self, X, y):
@@ -909,12 +975,20 @@ class _BaseSXE(BaseEstimator):
         self.grow_time_, self.weight_fit_time_ = best["grow_time"], best["weight_time"]
         self.n_candidates_ = len(cand)
 
-        sel_b = np.flatnonzero(w_batch > 1e-10)
-        if sel_b.size == 0:  # degenerate: keep the first batch at zero weight
-            sel_b = np.array([0], dtype=np.int64)
-            w_batch = np.zeros(Pb.shape[1])
-        sel = (sel_b[:, None] * batch + np.arange(batch)[None, :]).ravel()
-        weights = np.repeat(w_batch[sel_b] / batch, batch)
+        n_strata = best["n_strata"]
+        sel, weights = self._members_for(ens, w_batch, batch, n_strata, best["strat_counts"])
+        # How unequally the fit ended up weighting the shapes: 0 means it
+        # reproduced the averaged column, larger means the data separated them.
+        if n_strata > 1:
+            per = np.zeros(n_strata)
+            for col in np.flatnonzero(w_batch > 1e-10):
+                per[int(col) % n_strata] += w_batch[col]
+            tot = per.sum()
+            self.shape_spread_ = (
+                float(np.std(per / tot) * np.sqrt(n_strata)) if tot > 0 else 0.0
+            )
+        else:
+            self.shape_spread_ = 0.0
         # Physically drop the members that carry no weight. After this the
         # model object holds exactly the trees that contribute.
         self.ensemble_ = ens.subset(np.ascontiguousarray(sel, dtype=np.int32))
