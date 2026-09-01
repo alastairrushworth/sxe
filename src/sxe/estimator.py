@@ -152,7 +152,7 @@ class _BaseSXE(BaseEstimator):
         (8, 10, 12, 14) up to 100k, (10, 12, 14) above. Large-n strong-signal
         data wants deeper trees than a fixed default grows.
         Per-tree max depth, sampled uniformly. 0 means unlimited (capped 64).
-    max_leaf_nodes : int or None, default=None
+    max_leaf_nodes : int, sequence of int, or None, default=None
         If set, grow leaf-wise with this leaf budget instead of depth-wise.
     min_samples_leaf_range : tuple of int or None, default=None
         Sampled log-uniformly per tree. None sizes the floor to the data:
@@ -187,6 +187,27 @@ class _BaseSXE(BaseEstimator):
         clipped to [0, 1] -- so a leaf the holdout contradicts is damped and
         one it confirms is kept whole. The value is the strength of the pull
         toward 1 (in holdout rows); 0 is the raw holdout fit. None disables.
+    config_scope : {"auto", "tree", "batch", "mixed"}, default="auto"
+        Whose draw the per-tree settings (depth, leaf budget, leaf floor,
+        candidate fraction, pruning strength) come from. "tree" draws one per
+        tree, so every batch mixes configurations and the batch column is an
+        average over the whole range -- the ranges are then part of the model,
+        and only a search outside the fit can move them. "batch" draws one per
+        batch and shares it across the batch's trees, so the batch column is a
+        weak learner of a single configuration and the weight fit, which
+        selects batches on held-out data, is selecting configurations.
+        "mixed" alternates the two on one trajectory. "auto" (the default)
+        fits "tree" and a wide-box "batch" candidate and keeps whichever the
+        validation fold prefers, which costs a second fit and removes the
+        choice from the user: measured, mixing wins on noisy data (adult,
+        friedman1) and selection wins on smooth regression (superconduct,
+        diamonds, california), and no single setting is right for both.
+    config_search : {"adaptive", "random"}, default="adaptive"
+        Only with ``config_scope="batch"``. "random" draws each batch's
+        configuration from the ranges. "adaptive" tries every tree shape once
+        (each depth, each leaf budget), then draws in proportion to the
+        validation improvement each shape has earned, with a floor so none is
+        excluded -- the fit spends its later batches on what is working.
     leaf_refit : {"train", "all"}, default="train"
         Which rows an exported leaf's value is estimated from. "train": the
         rows the tree grew on. "all": those plus the holdout rows that reach
@@ -309,6 +330,8 @@ class _BaseSXE(BaseEstimator):
         max_bins=255,
         max_depth_choices=None,
         max_leaf_nodes=None,
+        config_scope="auto",
+        config_search="adaptive",
         min_samples_leaf_range=None,
         max_features_range=(0.5, 1.0),
         holdout="batch",
@@ -348,6 +371,8 @@ class _BaseSXE(BaseEstimator):
         self.max_bins = max_bins
         self.max_depth_choices = max_depth_choices
         self.max_leaf_nodes = max_leaf_nodes
+        self.config_scope = config_scope
+        self.config_search = config_search
         self.min_samples_leaf_range = min_samples_leaf_range
         self.max_features_range = max_features_range
         self.holdout = holdout
@@ -418,8 +443,19 @@ class _BaseSXE(BaseEstimator):
             raise ValueError(f"splitter must be 'best' or 'random', got {self.splitter!r}")
         if self.n_thresholds < 1:
             raise ValueError(f"n_thresholds must be >= 1, got {self.n_thresholds}")
-        if self.max_leaf_nodes is not None and self.max_leaf_nodes < 2:
-            raise ValueError(f"max_leaf_nodes must be >= 2 or None, got {self.max_leaf_nodes}")
+        if self.config_search not in ("random", "adaptive"):
+            raise ValueError(f"config_search must be 'random' or 'adaptive', got {self.config_search!r}")
+        if self.config_scope not in ("auto", "tree", "batch", "mixed"):
+            raise ValueError(
+                f"config_scope must be 'auto', 'tree', 'batch' or 'mixed', "
+                f"got {self.config_scope!r}"
+            )
+        leafc = self._leaf_choices()
+        if any(v != 0 and v < 2 for v in leafc):
+            raise ValueError(
+                f"max_leaf_nodes entries must be >= 2, 0 (depth-wise) or None, "
+                f"got {self.max_leaf_nodes!r}"
+            )
         if self.hybrid_min < 1:
             raise ValueError(f"hybrid_min must be >= 1, got {self.hybrid_min}")
         if self.loss not in ("squared", "logistic"):
@@ -465,6 +501,19 @@ class _BaseSXE(BaseEstimator):
                 f"max_features_range must lie in (0, 1], got {self.max_features_range!r}"
             )
         return depths, leaf, feat, sub, lam
+
+    def _leaf_choices(self):
+        """Leaf budgets a tree may draw; 0 means depth-wise growth.
+
+        A scalar (or None) is the fixed growth policy the fit has always had;
+        a sequence makes the policy one more randomized-and-selected axis.
+        """
+        v = self.max_leaf_nodes
+        if v is None:
+            return [0]
+        if np.isscalar(v):
+            return [int(v)]
+        return [int(x) for x in v]
 
     def _n_jobs(self):
         return -1 if self.n_jobs is None else self.n_jobs
@@ -630,6 +679,155 @@ class _BaseSXE(BaseEstimator):
         z = F + (y_val - p) / h
         return self._fit_weights_relaxed(Pb, z, 1.0, cv, sw=h)
 
+    #: the wide box the "batch" candidate searches: every depth including
+    #: unlimited, every leaf budget, leaf floors from 2 to 70, and candidate
+    #: fractions from a third of the columns to all of them
+    _WIDE_BOX = dict(
+        depths=(4, 6, 8, 10, 12, 0),
+        leaf=(2, 70),
+        feat=(0.35, 1.0),
+        leaf_choices=[0, 31, 63, 127, 255],
+    )
+
+    def _candidates(self, depths, leaf, feat):
+        """The (policy, box) pairs this fit will try.
+
+        ``config_scope="auto"`` offers two: the box-averaged weak learner the
+        method has always used, and a deliberately wide box whose
+        configuration is drawn per batch and searched adaptively, so the
+        weight fit selects tree shapes instead of averaging over them. Which
+        wins is a property of the data -- averaging wins on noisy problems,
+        selection wins on smooth ones -- so the fit runs both and keeps
+        whichever the validation fold prefers. Any explicit ``config_scope``
+        names one candidate and costs one fit.
+
+        A box the user set explicitly is honoured by both candidates; the wide
+        box only fills in the axes left at their defaults.
+        """
+        own = dict(scope=self.config_scope, leaf_choices=self._leaf_choices(),
+                   depths=depths, leaf=leaf, feat=feat)
+        if self.config_scope != "auto":
+            return [own]
+        own["scope"] = "tree"
+        wide = dict(
+            scope="batch",
+            leaf_choices=(self._leaf_choices() if self.max_leaf_nodes is not None
+                          else self._WIDE_BOX["leaf_choices"]),
+            depths=(self._WIDE_BOX["depths"] if self.max_depth_choices is None else depths),
+            leaf=(self._WIDE_BOX["leaf"] if self.min_samples_leaf_range is None else leaf),
+            feat=(self._WIDE_BOX["feat"] if self.max_features_range == (0.5, 1.0) else feat),
+        )
+        return [own, wide]
+
+    def _val_loss(self, ens, members, weights, intercept, Xval, y_val, n_jobs):
+        """Loss of a fitted candidate on the validation fold, in its own units.
+
+        The fold also fitted the weights, so this is optimistic -- equally so
+        for every candidate, which is what makes the comparison usable.
+        """
+        s = ens.predict_weighted(Xval, members, weights, intercept, n_jobs)
+        y = np.ascontiguousarray(y_val)
+        if not self._is_classifier():
+            return float(np.mean((y - s) ** 2))
+        if self._logistic():
+            if s.ndim == 2:
+                z = s - s.max(axis=1, keepdims=True)
+                p = np.exp(z) / np.exp(z).sum(axis=1, keepdims=True)
+            else:
+                p = 1.0 / (1.0 + np.exp(-s))
+        else:
+            p = np.clip(s, 1e-6, 1 - 1e-6)
+        p = np.clip(p, 1e-12, 1 - 1e-12)
+        if y.ndim == 2:
+            return float(-np.mean((y * np.log(p)).sum(axis=1)))
+        return float(-np.mean(y * np.log(p) + (1 - y) * np.log(1 - p)))
+
+    def _generate(self, Xtr, ytr, Xval, y_val, oob_idx, batch, max_iter, scale, folds,
+                  n_out, depths, leaf, feat, sub, lam, scope, leaf_choices, seed, n_jobs):
+        """Grow one dictionary under one configuration policy and weight it."""
+        ens = _core.Ensemble()
+        n_members, n_batches, P_oob = ens.boost(
+            X=Xtr,
+            y=ytr,
+            X_val=Xval,
+            y_val=y_val,
+            holdout_folds=folds,
+            oob_idx=oob_idx,
+            batch=batch,
+            max_batches=int(max_iter),
+            shrink=float(self.learning_rate),
+            patience=int(self.n_iter_no_change),
+            tol=float(self.tol) * scale,
+            n_thresh=int(self.n_thresholds),
+            argmax_bins=1 if self.splitter == "best" else 0,
+            max_leaves=int(leaf_choices[0]),
+            config_scope={"tree": 0, "batch": 1, "mixed": 2}[scope],
+            leaf_choices=list(leaf_choices),
+            config_search=1 if self.config_search == "adaptive" else 0,
+            sub_lo=sub[0],
+            sub_hi=sub[1],
+            depth_choices=[int(d) for d in depths],
+            leaf_lo=int(leaf[0]),
+            leaf_hi=int(leaf[1]),
+            feat_lo=feat[0],
+            feat_hi=feat[1],
+            lam_lo=lam[0],
+            lam_hi=lam[1],
+            leaf_shrink=-1.0 if self.leaf_shrinkage is None else float(self.leaf_shrinkage),
+            hist_bits=int(self.hist_bits),
+            leaf_l2=float(self.leaf_l2),
+            loss=1 if self._logistic() else 0,
+            linear_feats=int(self.linear_leaves) if not self._is_classifier() else 0,
+            linear_lambda=float(self.linear_lambda),
+            feature_power=float(self.feature_weighting),
+            leaf_refit_all=1 if self.leaf_refit == "all" else 0,
+            honest_residuals=1 if self.honest_residuals else 0,
+            hybrid_min=int(self.hybrid_min),
+            seed=seed,
+            n_jobs=n_jobs,
+        )
+        # One column per batch rather than per tree: the weight fit's cost
+        # becomes independent of the number of trees, and it can drop whole
+        # steps of the boosting trajectory.
+        t_w = time.perf_counter()
+        Pb = ens.predict_batch_means(Xval, batch, n_jobs)
+        yflat = np.ascontiguousarray(y_val).ravel()
+        if folds and P_oob.shape[0]:
+            # honest rows from the training fold on top of the validation
+            # fold; whole samples shuffled with a fixed permutation, since a
+            # K-output sample occupies K consecutive rows the softmax working
+            # response must keep together
+            P_all = np.vstack([P_oob, Pb])
+            y_all = np.concatenate([np.ascontiguousarray(ytr[oob_idx]).ravel(), yflat])
+            n_samp = len(y_all) // n_out
+            order = (
+                np.random.default_rng(0).permutation(n_samp)[:, None] * n_out
+                + np.arange(n_out)[None, :]
+            ).ravel()
+            Pb_fit, y_fit = np.ascontiguousarray(P_all[order]), y_all[order]
+        else:
+            Pb_fit, y_fit = Pb, yflat
+        if self._logistic():
+            w_batch, intercept = self._fit_weights_logistic(
+                Pb_fit, y_fit, int(min(self.weight_cv, len(y_fit))), ens.n_out
+            )
+        else:
+            w_batch, intercept = self._fit_weights(Pb_fit, y_fit)
+        weight_time = time.perf_counter() - t_w
+
+        sel_b = np.flatnonzero(w_batch > 1e-10)
+        probe_b = sel_b if sel_b.size else np.array([0], dtype=np.int64)
+        probe = np.ascontiguousarray(
+            (probe_b[:, None] * batch + np.arange(batch)[None, :]).ravel(), dtype=np.int32
+        )
+        w_probe = np.ascontiguousarray(np.repeat(w_batch[probe_b] / batch, batch))
+        loss = self._val_loss(ens, probe, w_probe, float(intercept), Xval, y_val, n_jobs)
+        return dict(
+            ens=ens, n_members=n_members, n_batches=n_batches, Pb=Pb,
+            w_batch=w_batch, intercept=float(intercept), weight_time=weight_time,
+            val_loss=loss,
+        )
+
     # -- fit -----------------------------------------------------------------
     def _fit(self, X, y):
         t0 = time.perf_counter()
@@ -667,9 +865,7 @@ class _BaseSXE(BaseEstimator):
         depths = d_depths if depths is None else depths
         leaf = d_leaf if leaf is None else leaf
         max_iter = d_iter if self.max_iter is None else int(self.max_iter)
-        self.max_depth_choices_, self.min_samples_leaf_range_, self.max_iter_ = (
-            tuple(int(d) for d in depths), (int(leaf[0]), int(leaf[1])), int(max_iter)
-        )
+        self.max_iter_ = int(max_iter)
         # Early-stopping tolerance in the units the loop watches: MSE (a
         # fraction of the target variance) or deviance (a fraction of the
         # base-rate entropy).
@@ -689,85 +885,36 @@ class _BaseSXE(BaseEstimator):
         folds = int(self.holdout_folds) if self.holdout == "batch" else 0
         n_oob = min(len(tr_idx), max(2000, 200_000 // n_out)) if folds else 0
         oob_idx = np.ascontiguousarray(np.sort(rng.permutation(len(tr_idx))[:n_oob]), dtype=np.int32)
-        ens = _core.Ensemble()
-        t_grow = time.perf_counter()
-        n_members, n_batches, P_oob = ens.boost(
-            X=Xtr,
-            y=ytr,
-            X_val=Xval,
-            y_val=y_val,
-            holdout_folds=folds,
-            oob_idx=oob_idx,
-            batch=batch,
-            max_batches=int(max_iter),
-            shrink=float(self.learning_rate),
-            patience=int(self.n_iter_no_change),
-            tol=float(self.tol) * scale,
-            n_thresh=int(self.n_thresholds),
-            argmax_bins=1 if self.splitter == "best" else 0,
-            max_leaves=0 if self.max_leaf_nodes is None else int(self.max_leaf_nodes),
-            sub_lo=sub[0],
-            sub_hi=sub[1],
-            depth_choices=[int(d) for d in depths],
-            leaf_lo=int(leaf[0]),
-            leaf_hi=int(leaf[1]),
-            feat_lo=feat[0],
-            feat_hi=feat[1],
-            lam_lo=lam[0],
-            lam_hi=lam[1],
-            leaf_shrink=-1.0 if self.leaf_shrinkage is None else float(self.leaf_shrinkage),
-            hist_bits=int(self.hist_bits),
-            leaf_l2=float(self.leaf_l2),
-            loss=1 if self._logistic() else 0,
-            linear_feats=int(self.linear_leaves) if not self._is_classifier() else 0,
-            linear_lambda=float(self.linear_lambda),
-            feature_power=float(self.feature_weighting),
-            leaf_refit_all=1 if self.leaf_refit == "all" else 0,
-            honest_residuals=1 if self.honest_residuals else 0,
-            hybrid_min=int(self.hybrid_min),
-            seed=int(rng.integers(2**63 - 1)),
-            n_jobs=n_jobs,
-        )
-        self.grow_time_ = time.perf_counter() - t_grow
-
-        # One column per batch rather than per tree: the weight fit's cost
-        # becomes independent of the number of trees, and it can drop whole
-        # steps of the boosting trajectory.
-        t_w = time.perf_counter()
-        # For a K-column target the design matrix stacks the K outputs of
-        # every validation row -- one weight per batch, shared by all K.
-        Pb = ens.predict_batch_means(Xval, batch, n_jobs)
-        yflat = np.ascontiguousarray(y_val).ravel()
-        if folds and P_oob.shape[0]:
-            # honest rows from the training fold on top of the validation
-            # fold; rows shuffled with a fixed permutation so the CV folds
-            # of the weight fit mix both sources
-            P_all = np.vstack([P_oob, Pb])
-            y_all = np.concatenate([np.ascontiguousarray(ytr[oob_idx]).ravel(), yflat])
-            # shuffle whole samples: a K-output sample occupies K consecutive
-            # rows that the softmax working response must keep together
-            n_samp = len(y_all) // n_out
-            order = (
-                np.random.default_rng(0).permutation(n_samp)[:, None] * n_out
-                + np.arange(n_out)[None, :]
-            ).ravel()
-            Pb_fit, y_fit = np.ascontiguousarray(P_all[order]), y_all[order]
-        else:
-            Pb_fit, y_fit = Pb, yflat
-        if self._logistic():
-            w_batch, intercept = self._fit_weights_logistic(
-                Pb_fit, y_fit, int(min(self.weight_cv, len(y_fit))), ens.n_out
+        seed_base = int(rng.integers(2**63 - 1))
+        cand = self._candidates(depths, leaf, feat)
+        best = None
+        for c in cand:
+            t_grow = time.perf_counter()
+            trial = self._generate(
+                Xtr, ytr, Xval, y_val, oob_idx, batch, max_iter, scale, folds, n_out,
+                c["depths"], c["leaf"], c["feat"], sub, lam,
+                c["scope"], c["leaf_choices"], seed_base, n_jobs
             )
-        else:
-            w_batch, intercept = self._fit_weights(Pb_fit, y_fit)
+            trial["grow_time"] = time.perf_counter() - t_grow
+            trial["cand"] = c
+            if best is None or trial["val_loss"] < best["val_loss"]:
+                best = trial
+        self.config_scope_ = best["cand"]["scope"]
+        self.max_leaf_nodes_ = best["cand"]["leaf_choices"]
+        self.max_depth_choices_ = tuple(int(d) for d in best["cand"]["depths"])
+        self.min_samples_leaf_range_ = (int(best["cand"]["leaf"][0]), int(best["cand"]["leaf"][1]))
+        ens = best["ens"]
+        n_members, n_batches = best["n_members"], best["n_batches"]
+        w_batch, intercept, Pb = best["w_batch"], best["intercept"], best["Pb"]
+        self.grow_time_, self.weight_fit_time_ = best["grow_time"], best["weight_time"]
+        self.n_candidates_ = len(cand)
+
         sel_b = np.flatnonzero(w_batch > 1e-10)
         if sel_b.size == 0:  # degenerate: keep the first batch at zero weight
             sel_b = np.array([0], dtype=np.int64)
             w_batch = np.zeros(Pb.shape[1])
         sel = (sel_b[:, None] * batch + np.arange(batch)[None, :]).ravel()
         weights = np.repeat(w_batch[sel_b] / batch, batch)
-        self.weight_fit_time_ = time.perf_counter() - t_w
-
         # Physically drop the members that carry no weight. After this the
         # model object holds exactly the trees that contribute.
         self.ensemble_ = ens.subset(np.ascontiguousarray(sel, dtype=np.int32))

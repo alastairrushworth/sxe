@@ -192,7 +192,10 @@ def test_structural_defaults_follow_the_training_size():
     from sxe import SXERegressor
 
     X, y = make_regression(n_samples=1200, n_features=6, random_state=0)
-    m = SXERegressor(random_state=0, max_iter=3, batch_size=4).fit(X, y)
+    # config_scope="tree" pins the candidate, so the fitted attributes report
+    # the resolved structural defaults rather than a wide-box candidate that
+    # the validation fold may have preferred
+    m = SXERegressor(random_state=0, max_iter=3, batch_size=4, config_scope="tree").fit(X, y)
     assert m.max_depth_choices_ == (6, 8, 10, 12)
     assert m.min_samples_leaf_range_ == (10, 60)
     assert m.max_iter_ == 3  # an explicit max_iter is kept

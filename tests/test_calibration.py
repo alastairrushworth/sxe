@@ -62,9 +62,16 @@ def test_proba_is_a_distribution(data):
 
 
 def test_calibration_improves_log_loss_and_brier(data):
+    """Both losses, on a pinned candidate.
+
+    ``config_scope="tree"`` fixes which trajectory is fitted: what is under
+    test is the calibrator, and letting the validation fold pick between two
+    candidates would compare two different models as well as two heads.
+    """
     Xtr, Xte, ytr, yte = data
-    on = SXEClassifier(calibrate="sigmoid", **CFG).fit(Xtr, ytr).predict_proba(Xte)[:, 1]
-    off = SXEClassifier(calibrate=None, **CFG).fit(Xtr, ytr).predict_proba(Xte)[:, 1]
+    cfg = dict(CFG, config_scope="tree")
+    on = SXEClassifier(calibrate="sigmoid", **cfg).fit(Xtr, ytr).predict_proba(Xte)[:, 1]
+    off = SXEClassifier(calibrate=None, **cfg).fit(Xtr, ytr).predict_proba(Xte)[:, 1]
     assert log_loss(yte, on) < log_loss(yte, off)
     assert brier_score_loss(yte, on) < brier_score_loss(yte, off)
 

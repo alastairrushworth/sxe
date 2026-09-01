@@ -42,6 +42,51 @@
     },
     "search_loss": -0.9244787426029965
   },
+  "aps_failure/LightGBM": {
+    "params": {
+      "bagging_fraction": 0.9079267770607661,
+      "bagging_freq": 1,
+      "feature_fraction": 0.9610434542726609,
+      "lambda_l2": 0.0010255432976732015,
+      "learning_rate": 0.07871809912482117,
+      "min_child_samples": 25,
+      "num_leaves": 166
+    },
+    "search_loss": -0.983828232069438
+  },
+  "aps_failure/SXE": {
+    "params": {
+      "batch_size": 12,
+      "holdout": "random",
+      "learning_rate": 0.15020581450769702,
+      "max_depth_choices": [
+        0
+      ],
+      "max_features_range": [
+        0.85,
+        1.0
+      ],
+      "max_iter": 600,
+      "max_leaf_nodes": 511,
+      "min_samples_leaf_range": [
+        20,
+        70
+      ],
+      "n_iter_no_change": 20,
+      "n_thresholds": 2,
+      "prune_strength_range": [
+        0.001,
+        0.05
+      ],
+      "splitter": "best",
+      "subsample_range": [
+        0.5,
+        0.8
+      ],
+      "validation_fraction": 0.1
+    },
+    "search_loss": -0.9836847537350049
+  },
   "bank_marketing/LightGBM": {
     "params": {
       "bagging_fraction": 0.9066351196001362,
@@ -219,6 +264,47 @@
     },
     "search_loss": -0.9970076072255032
   },
+  "diamonds/LightGBM": {
+    "params": {
+      "bagging_fraction": 0.9066351196001362,
+      "bagging_freq": 1,
+      "feature_fraction": 0.4099165813171175,
+      "lambda_l2": 4.477363031844235,
+      "learning_rate": 0.08727093859002812,
+      "min_child_samples": 6,
+      "num_leaves": 25
+    },
+    "search_loss": 0.08620465704930572
+  },
+  "diamonds/SXE": {
+    "params": {
+      "batch_size": 8,
+      "holdout": "batch",
+      "holdout_folds": 8,
+      "learning_rate": 0.010101531944380873,
+      "max_depth_choices": [
+        0
+      ],
+      "max_features_range": [
+        0.35,
+        0.65
+      ],
+      "max_iter": 600,
+      "min_samples_leaf_range": [
+        5,
+        30
+      ],
+      "n_iter_no_change": 40,
+      "n_thresholds": 3,
+      "prune_strength_range": [
+        0.01,
+        2.0
+      ],
+      "splitter": "random",
+      "validation_fraction": 0.18
+    },
+    "search_loss": 0.09239092421849997
+  },
   "friedman1_noise/LightGBM": {
     "params": {
       "bagging_fraction": 0.6294322965854662,
@@ -260,6 +346,63 @@
       "validation_fraction": 0.18
     },
     "search_loss": 1.0405633908554044
+  },
+  "higgs98k/LightGBM": {
+    "params": {
+      "bagging_fraction": 0.8101067260076888,
+      "bagging_freq": 1,
+      "feature_fraction": 0.6551371749094453,
+      "lambda_l2": 9.558418047801041,
+      "learning_rate": 0.04471883236309089,
+      "min_child_samples": 22,
+      "num_leaves": 424
+    },
+    "search_loss": -0.8154370755565598
+  },
+  "higgs98k/SXE": {
+    "params": {},
+    "search_loss": -0.8125906080602913
+  },
+  "jannis/LightGBM": {
+    "params": {
+      "bagging_fraction": 0.8145540757698546,
+      "bagging_freq": 1,
+      "feature_fraction": 0.46329716774213775,
+      "lambda_l2": 5.112322143469584,
+      "learning_rate": 0.01971099296465461,
+      "min_child_samples": 15,
+      "num_leaves": 402
+    },
+    "search_loss": -0.7292993630573248
+  },
+  "jannis/SXE": {
+    "params": {
+      "batch_size": 8,
+      "holdout": "batch",
+      "holdout_folds": 8,
+      "learning_rate": 0.010101531944380873,
+      "max_depth_choices": [
+        0
+      ],
+      "max_features_range": [
+        0.35,
+        0.65
+      ],
+      "max_iter": 300,
+      "min_samples_leaf_range": [
+        5,
+        30
+      ],
+      "n_iter_no_change": 40,
+      "n_thresholds": 3,
+      "prune_strength_range": [
+        0.01,
+        2.0
+      ],
+      "splitter": "random",
+      "validation_fraction": 0.18
+    },
+    "search_loss": -0.7263136942675159
   },
   "letter/LightGBM": {
     "params": {
@@ -395,5 +538,49 @@
       "validation_fraction": 0.15
     },
     "search_loss": 9.592958873469936
+  },
+  "volkert/LightGBM": {
+    "params": {
+      "bagging_fraction": 0.8145540757698546,
+      "bagging_freq": 1,
+      "feature_fraction": 0.46329716774213775,
+      "lambda_l2": 5.112322143469584,
+      "learning_rate": 0.01971099296465461,
+      "min_child_samples": 15,
+      "num_leaves": 402
+    },
+    "search_loss": -0.7020577307802229
+  },
+  "volkert/SXE": {
+    "params": {
+      "batch_size": 8,
+      "holdout": "random",
+      "learning_rate": 0.18869450515385874,
+      "max_depth_choices": [
+        0
+      ],
+      "max_features_range": [
+        0.85,
+        1.0
+      ],
+      "max_iter": 300,
+      "min_samples_leaf_range": [
+        3,
+        20
+      ],
+      "n_iter_no_change": 20,
+      "n_thresholds": 2,
+      "prune_strength_range": [
+        0.001,
+        0.05
+      ],
+      "splitter": "random",
+      "subsample_range": [
+        0.9,
+        1.0
+      ],
+      "validation_fraction": 0.15
+    },
+    "search_loss": -0.7106316090311517
   }
 }

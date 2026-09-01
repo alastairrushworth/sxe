@@ -21,6 +21,15 @@ reports LightGBM on raw NaNs and declared categoricals: the gap between it and
 ``LightGBM`` is the price of SXE's missing features, measured rather than
 asserted.
 
+Time is reported in two parts. ``train s`` is one fit on the training split --
+what a user pays every time they fit. ``search s`` is the one-off wall-clock of
+the hyperparameter search that produced the configuration, cross-validated on a
+held-out fold, and is zero for the ``-default`` rows because their
+configuration came out of the box. ``total s`` is the sum, which is the honest
+cost of arriving at that model from nothing. SXE's per-batch configuration
+search runs *inside* the fit, so it is charged to ``train s``; LightGBM's runs
+outside it, so it is charged to ``search s``.
+
 Size uses one formula on both sides (13 bytes per internal node, 8 per leaf,
 plus the bin table a binned model needs to predict at all). Time is each
 library at its own best thread count -- LightGBM slows monotonically with
@@ -180,6 +189,73 @@ def load_madelon(seed):
     return X.astype(np.float64), np.asarray(y).astype(int), "classification", cat
 
 
+# --- the 2026 expansion: medium-to-large open datasets -----------------------
+def load_year(seed):
+    b = _openml(44027)  # YearPredictionMSD
+    X, y, cat = _frame(b)
+    return X.astype(np.float64), y.astype(np.float64), "regression", cat
+
+
+def load_nyc_taxi(seed):
+    b = _openml(44065)  # nyc-taxi-green-dec-2016 (log tip amount)
+    X, y, cat = _frame(b)
+    return X, y.astype(np.float64), "regression", cat
+
+
+def load_allstate(seed):
+    b = _openml(42571)  # Allstate claims severity: 116 categoricals, skewed loss
+    X, y, cat = _frame(b)
+    return X, y.astype(np.float64), "regression", cat
+
+
+def load_diamonds(seed):
+    b = _openml(44059)  # log price, 3 categoricals
+    X, y, cat = _frame(b)
+    return X, y.astype(np.float64), "regression", cat
+
+
+def load_medical_charges(seed):
+    b = _openml(44146)  # log average medicare payments
+    X, y, cat = _frame(b)
+    return X.astype(np.float64), y.astype(np.float64), "regression", cat
+
+
+def load_higgs98k(seed):
+    b = _openml(23512)  # HIGGS 98k subset; a few missing cells
+    X, y, cat = _frame(b)
+    return X, (np.asarray(y).astype(str) == "1").astype(int), "classification", cat
+
+
+def load_miniboone(seed):
+    b = _openml(41150)
+    X, y, cat = _frame(b)
+    return X.astype(np.float64), (np.asarray(y).astype(str) == "True").astype(int), "classification", cat
+
+
+def load_airlines(seed):
+    b = _openml(1169)  # departure delay; airline/airport categoricals
+    X, y, cat = _frame(b)
+    return X, (np.asarray(y).astype(str) == "1").astype(int), "classification", cat
+
+
+def load_aps_failure(seed):
+    b = _openml(41138)  # 8% missing cells, 1.8% positives
+    X, y, cat = _frame(b)
+    return X, (np.asarray(y).astype(str) == "pos").astype(int), "classification", cat
+
+
+def load_jannis(seed):
+    b = _openml(41168)
+    X, y, cat = _frame(b)
+    return X.astype(np.float64), np.asarray(y).astype(int), "multiclass", cat
+
+
+def load_volkert(seed):
+    b = _openml(41166)
+    X, y, cat = _frame(b)
+    return X.astype(np.float64), np.asarray(y).astype(int), "multiclass", cat
+
+
 DATASETS = {
     # loader, seeds averaged over, tuning draws per library, SXE max_iter cap,
     # thread counts to time at, and what the dataset is here to stress.
@@ -261,7 +337,101 @@ DATASETS = {
         threads=(1, -1),
         note="p >> n: 500 features, 2600 rows, mostly noise",
     ),
+    # --- the 2026 expansion: sized budgets follow the covtype_full precedent
+    # (large n: all-cores timing only, fewer draws, moderate caps) ---
+    "diamonds": dict(
+        loader=load_diamonds,
+        seeds=5,
+        budget=24,
+        cap=600,
+        threads=(1, -1),
+        note="54k rows, log price, 3 low-cardinality categoricals",
+    ),
+    "volkert": dict(
+        loader=load_volkert,
+        seeds=3,
+        budget=12,
+        cap=300,
+        threads=(-1,),
+        note="58k x 180, 10 classes: wide vector leaves",
+    ),
+    "connect_placeholder_unused": None,
 }
+del DATASETS["connect_placeholder_unused"]
+DATASETS.update({
+    "jannis": dict(
+        loader=load_jannis,
+        seeds=3,
+        budget=16,
+        cap=300,
+        threads=(-1,),
+        note="84k x 54, 4 imbalanced classes, anonymised features",
+    ),
+    "aps_failure": dict(
+        loader=load_aps_failure,
+        seeds=3,
+        budget=16,
+        cap=600,
+        threads=(-1,),
+        note="76k x 170, 8% missing cells, 1.8% positives",
+    ),
+    "higgs98k": dict(
+        loader=load_higgs98k,
+        seeds=3,
+        budget=16,
+        cap=600,
+        threads=(-1,),
+        note="98k x 28 physics features, near-balanced",
+    ),
+    "miniboone": dict(
+        loader=load_miniboone,
+        seeds=3,
+        budget=16,
+        cap=600,
+        threads=(-1,),
+        note="130k x 50, clean numeric binary",
+    ),
+    "medical_charges": dict(
+        loader=load_medical_charges,
+        seeds=3,
+        budget=16,
+        cap=400,
+        threads=(-1,),
+        note="163k x 3, smooth low-dimensional log target",
+    ),
+    "allstate": dict(
+        loader=load_allstate,
+        seeds=3,
+        budget=12,
+        cap=400,
+        threads=(-1,),
+        note="188k x 130 with 116 categoricals, heavy-tailed loss",
+    ),
+    "year": dict(
+        loader=load_year,
+        seeds=3,
+        budget=10,
+        cap=300,
+        threads=(-1,),
+        note="515k x 90 audio features, regression",
+    ),
+    "airlines": dict(
+        loader=load_airlines,
+        seeds=3,
+        budget=10,
+        cap=300,
+        threads=(-1,),
+        note="539k x 7, categorical-heavy delay prediction",
+    ),
+    "nyc_taxi": dict(
+        loader=load_nyc_taxi,
+        seeds=3,
+        budget=10,
+        cap=300,
+        threads=(-1,),
+        note="582k x 16 with 7 categoricals, log tip target",
+    ),
+})
 
 # The hand-tuned configurations from the original report. They are entered
 # into the SXE search as warm starts so the random search cannot come out
@@ -393,7 +563,12 @@ def score(task, model, X, y):
     )
 
 
-def result(model_name, task, model, X, y, fit_s, n_trees, n_leaves, n_features, real_bytes):
+def result(model_name, task, model, X, y, fit_s, n_trees, n_leaves, n_features, real_bytes,
+           search_s=0.0):
+    """One row. ``fit_s`` is training alone; ``search_s`` is the one-off cost of
+    the hyperparameter search that produced this configuration, so the total
+    cost of arriving at the model is fit_s + search_s. A row whose
+    configuration came out of the box carries search_s = 0."""
     m1, v1, m2, v2 = score(task, model, X, y)
     struct, bins, portable = portable_bytes(n_leaves, n_trees, n_features)
     return dict(
@@ -403,6 +578,7 @@ def result(model_name, task, model, X, y, fit_s, n_trees, n_leaves, n_features, 
         metric2=m2,
         value2=v2,
         fit_s=fit_s,
+        search_s=search_s,
         n_trees=n_trees,
         n_leaves=n_leaves,
         n_features_model=n_features,
@@ -564,6 +740,7 @@ def tune(library, task, Xtr, ytr, seed, budget, cap, n_binary, warm=(), record=N
     accuracy alone, so the winner says nothing about what either library can do
     under a size budget -- the draws do, and they cost nothing extra to keep.
     """
+    t_search = time.perf_counter()
     strat = ytr if task != "regression" else None
     Xa, Xb, ya, yb = train_test_split(Xtr, ytr, test_size=0.15, random_state=seed, stratify=strat)
     rng = np.random.default_rng(seed)
@@ -587,10 +764,11 @@ def tune(library, task, Xtr, ytr, seed, budget, cap, n_binary, warm=(), record=N
                 f"({fit_s:.1f}s, {size / 1e6:.2f} MB) {params}",
                 flush=True,
             )
-    return best, float(best_loss)
+    return best, float(best_loss), time.perf_counter() - t_search
 
 
-def run_model(library, task, Xtr, ytr, Xte, yte, params, n_jobs, seed, cat_idx=None, tag=None):
+def run_model(library, task, Xtr, ytr, Xte, yte, params, n_jobs, seed, cat_idx=None, tag=None,
+              search_s=0.0):
     """Fit one configuration on the full training split and score it."""
     tag = tag or library
     if library == "SXE":
@@ -607,6 +785,7 @@ def run_model(library, task, Xtr, ytr, Xte, yte, params, n_jobs, seed, cat_idx=N
             m.n_leaves_,
             n_feat,
             m.model_size_bytes_,
+            search_s=search_s,
         )
     strat = ytr if task != "regression" else None
     Xa, Xb, ya, yb = train_test_split(Xtr, ytr, test_size=0.15, random_state=seed, stratify=strat)
@@ -624,6 +803,7 @@ def run_model(library, task, Xtr, ytr, Xte, yte, params, n_jobs, seed, cat_idx=N
         n_leaves,
         Xtr.shape[1],
         lightgbm_real_bytes(n_leaves, len(info)),
+        search_s=search_s,
     )
 
 
@@ -648,7 +828,7 @@ def summarise(rows, names):
         print(f"\n=== {name} ({m1} / {m2}, {seeds} seeds) ===")
         head = (
             f"  {'model':<18}{m1:<20}{m2:<18}{'leaves':<11}{'real MB':<10}"
-            f"{'portable':<11}{'best fit s':<14}{'@threads'}"
+            f"{'portable':<11}{'train s':<14}{'search s':<11}{'total s':<10}{'@thr'}"
         )
         print(head)
         print("  " + "-" * (len(head) - 2))
@@ -667,10 +847,15 @@ def summarise(rows, names):
                 by_thread.setdefault(r["n_jobs"], []).append(r["fit_s"])
             best_nj = min(by_thread, key=lambda k: statistics.mean(by_thread[k]))
             tm, ts = cell(by_thread[best_nj])
+            # Training and search are reported apart: training is what a user
+            # pays per fit, search is the one-off cross-validated cost of
+            # arriving at the configuration (zero for a model fitted at its
+            # defaults). The total is what the number in a paper should be.
+            sr = statistics.mean([r.get("search_s", 0.0) for r in base])
             print(
                 f"  {model:<18}{v1m:.4f} +- {v1s:.4f}   {v2m:>9.4f}         "
                 f"{lm:>9,.0f}  {sm / 1e6:>8.3f}  {pm / 1e6:>9.3f}  "
-                f"{tm:>6.2f} +- {ts:<5.2f}  {best_nj:>5}"
+                f"{tm:>6.2f} +-{ts:<5.2f}  {sr:>9.1f}  {tm + sr:>8.1f}  {best_nj:>4}"
             )
 
 
@@ -782,7 +967,7 @@ def main():
             if library == "SXE" and name in TUNED_SXE:
                 warm.append(TUNED_SXE[name])
             first = len(draws)
-            params, loss = tune(
+            params, loss, search_s = tune(
                 library,
                 d0["task"],
                 d0["Xtr"],
@@ -796,7 +981,8 @@ def main():
             )
             for d in draws[first:]:
                 d["dataset"] = name
-            tuned[key] = {"params": params, "search_loss": loss}
+            tuned[key] = {"params": params, "search_loss": loss, "search_s": search_s}
+            print(f"    search cost: {search_s:.1f}s over {budget} draws", flush=True)
             tuned_path.write_text(json.dumps(tuned, indent=2, sort_keys=True, default=list))
 
         for seed in seeds:
@@ -810,7 +996,11 @@ def main():
                 )
                 runs = []
                 for library in args.libraries:
-                    params = tuned[f"{name}/{library}"]["params"]
+                    entry = tuned[f"{name}/{library}"]
+                    params = entry["params"]
+                    # the one-off search cost that produced this configuration;
+                    # cached configs from an earlier run carry it forward
+                    search_s = float(entry.get("search_s", 0.0))
                     runs.append(
                         run_model(
                             library,
@@ -822,6 +1012,7 @@ def main():
                             params,
                             n_jobs,
                             seed,
+                            search_s=search_s,
                         )
                     )
                     runs.append(
@@ -855,6 +1046,7 @@ def main():
                                 seed,
                                 cat_idx=d["cat_idx"],
                                 tag="LightGBM-native",
+                                search_s=search_s,
                             )
                         )
                 for r in runs:

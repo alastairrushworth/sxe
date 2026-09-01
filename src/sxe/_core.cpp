@@ -1370,8 +1370,11 @@ public:
                     double leaf_shrink, int hist_bits, double leaf_l2, int loss,
                     int linear_feats, double linear_lambda,
                     double feature_power, int leaf_refit_all, int honest_residuals,
+                    int config_scope, const std::vector<int>& leaf_choices, int config_search,
                     int hybrid_min, uint64_t seed, int n_jobs)
     {
+        if (config_scope < 0 || config_scope > 2)
+            throw std::invalid_argument("config_scope must be 0 (tree), 1 (batch) or 2 (mixed)");
         if (feature_power < 0.0) throw std::invalid_argument("feature_weighting must be >= 0");
         if (linear_feats < 0 || linear_feats > 255) throw std::invalid_argument("linear_leaves must be in [0, 255]");
         if (linear_lambda <= 0.0 && linear_feats > 0) throw std::invalid_argument("linear_lambda must be > 0");
@@ -1410,6 +1413,13 @@ public:
         const uint8_t* Xv = Xva.data();
         const double* yv = yva.data();
         const int n_depth = (int)depth_choices.size();
+        const int n_leafc = (int)leaf_choices.size();
+        // 2 = mixed: odd batches draw one configuration for the whole batch
+        // (a weak learner of that shape, which the weight fit can select),
+        // even batches keep the per-tree draw (a weak learner that is an
+        // average over the whole box). Both kinds are in the design matrix,
+        // so the fit does not have to commit to mixture or point mass.
+        const bool batch_cfg = config_scope >= 1;
 
         std::vector<double> r(ya.data(), ya.data() + (size_t)n * K);  // residual (training target)
         std::vector<double> Fv((size_t)nv * K, 0.0);          // generation-ensemble val preds
@@ -1433,6 +1443,24 @@ public:
                     for (int k = 0; k < K; ++k) pout[i * K + k] /= z;
                 }
             }
+        };
+        // validation loss of the current generation ensemble Fv (MSE, or
+        // deviance under the logistic loss); used for early stopping and,
+        // with config_search, to score configurations
+        auto val_loss = [&]() {
+            double L = 0.0;
+            if (!logistic) {
+                for (int64_t i = 0; i < nv * K; ++i) { const double e = yv[i] - Fv[(size_t)i]; L += e * e; }
+            } else {
+                std::vector<double> pv((size_t)nv * K);
+                activate(Fv.data(), pv.data(), nv);
+                for (int64_t i = 0; i < nv * K; ++i) {
+                    const double pi = std::min(1.0 - 1e-12, std::max(1e-12, pv[(size_t)i]));
+                    if (K == 1) L -= yv[i] * std::log(pi) + (1.0 - yv[i]) * std::log(1.0 - pi);
+                    else L -= yv[i] * std::log(pi);
+                }
+            }
+            return L / (double)nv;
         };
         if (logistic) {
             F.assign((size_t)n * K, 0.0);
@@ -1467,6 +1495,29 @@ public:
         std::vector<double> fgain((size_t)p, 0.0), fweights((size_t)p, 1.0);
         const bool weighted = feature_power > 0.0;
 
+        // Configuration "shapes": one per depth choice for depth-wise growth,
+        // plus one per positive leaf budget for leaf-wise growth. With
+        // config_search=1 the batches round-robin the shapes once and then
+        // sample them in proportion to the validation improvement each has
+        // earned -- the fit spends its later batches on the configurations
+        // that are working, instead of drawing blind from the box.
+        std::vector<std::pair<int,int>> shapes;  // (max_depth, leaf_budget)
+        if (batch_cfg) {
+            for (int i = 0; i < n_depth; ++i) {
+                const int d0 = depth_choices[i];
+                shapes.emplace_back(d0 <= 0 ? 64 : d0, 0);
+            }
+            for (int i = 0; i < n_leafc; ++i)
+                if (leaf_choices[i] > 0) shapes.emplace_back(64, leaf_choices[i]);
+            if (shapes.empty()) shapes.emplace_back(64, max_leaves);
+        }
+        const int n_shapes = (int)shapes.size();
+        const bool adaptive = batch_cfg && config_search == 1 && n_shapes > 1;
+        std::vector<double> shape_gain((size_t)std::max(1, n_shapes), 0.0);
+        std::vector<int> shape_seen((size_t)std::max(1, n_shapes), 0);
+        int cur_shape = 0, shape_round = 0;
+        double prev_loss = 0.0;
+
         double best = 1e300;
         int bad = 0, n_batches = 0;
         // Quantized training: each batch the residual is scaled so its largest
@@ -1480,6 +1531,7 @@ public:
         {
             py::gil_scoped_release nogil;
             ThreadPool pool(resolve_threads(n_jobs) - 1);
+            prev_loss = val_loss();
 
             for (int b = 0; b < max_batches; ++b) {
                 const size_t offset = members.size();
@@ -1497,6 +1549,49 @@ public:
                         oob_cols.emplace_back((size_t)n_oob * K, 0.0f);
                         std::fill(oob_cnt.begin(), oob_cnt.end(), 0);
                     }
+                }
+                // Per-batch configuration. With config_scope=1 every tree in the
+                // batch shares one draw, so the batch column is a weak learner of
+                // ONE configuration and the weight fit -- which selects batches on
+                // held-out data -- is selecting configurations. With scope=0 the
+                // draws stay per tree and the RNG stream is untouched.
+                int cfg_depth = 0, cfg_minleaf = 0, cfg_K = 0, cfg_leaves = max_leaves;
+                double cfg_lam = 0.0;
+                const bool cfg_now = config_scope == 1 || (config_scope == 2 && (b % 2 == 1));
+                if (cfg_now) {
+                    std::mt19937_64 crng(splitmix64(seed ^ 0x5BD1E9955BD1E995ULL) +
+                                         0x9E3779B97F4A7C15ULL * (uint64_t)(b + 1));
+                    std::uniform_real_distribution<double> CU(0.0, 1.0);
+                    if (adaptive) {
+                        if (shape_round < n_shapes) {
+                            cur_shape = shape_round;  // round-robin warm-up: every shape once
+                        } else {
+                            // sample in proportion to earned improvement, with a
+                            // floor of one share so no shape is ever excluded
+                            const double floor_w = 1.0 / (double)n_shapes;
+                            double tot = 0.0;
+                            for (int i = 0; i < n_shapes; ++i)
+                                tot += floor_w + std::max(0.0, shape_gain[(size_t)i]);
+                            double u = CU(crng) * tot, acc = 0.0;
+                            cur_shape = n_shapes - 1;
+                            for (int i = 0; i < n_shapes; ++i) {
+                                acc += floor_w + std::max(0.0, shape_gain[(size_t)i]);
+                                if (u <= acc) { cur_shape = i; break; }
+                            }
+                        }
+                        ++shape_round;
+                        cfg_depth = shapes[(size_t)cur_shape].first;
+                    } else {
+                        const int d0 = depth_choices[(int)(CU(crng) * n_depth) % n_depth];
+                        cfg_depth = (d0 <= 0) ? 64 : d0;
+                    }
+                    cfg_minleaf = (int)std::lround(std::exp(
+                        std::log((double)leaf_lo) +
+                        CU(crng) * (std::log((double)leaf_hi) - std::log((double)leaf_lo))));
+                    cfg_K = std::max(1, (int)std::lround((feat_lo + CU(crng) * (feat_hi - feat_lo)) * p));
+                    cfg_lam = std::exp(std::log(lam_lo) + CU(crng) * (std::log(lam_hi) - std::log(lam_lo)));
+                    if (adaptive) cfg_leaves = shapes[(size_t)cur_shape].second;
+                    else if (n_leafc > 1) cfg_leaves = leaf_choices[(int)(CU(crng) * n_leafc) % n_leafc];
                 }
                 if (quant) {
                     double amax = 0.0;
@@ -1518,12 +1613,20 @@ public:
 
                     std::uniform_real_distribution<double> U(0.0, 1.0);
                     TreeParams tp;
-                    int d = depth_choices[(int)(U(ws.rng) * n_depth) % n_depth];
-                    tp.max_depth = (d <= 0) ? 64 : d;
-                    tp.min_leaf = (int)std::lround(std::exp(
-                        std::log((double)leaf_lo) +
-                        U(ws.rng) * (std::log((double)leaf_hi) - std::log((double)leaf_lo))));
-                    tp.K = std::max(1, (int)std::lround((feat_lo + U(ws.rng) * (feat_hi - feat_lo)) * p));
+                    int tree_leaves = max_leaves;
+                    if (cfg_now) {
+                        tp.max_depth = cfg_depth; tp.min_leaf = cfg_minleaf; tp.K = cfg_K;
+                        tree_leaves = cfg_leaves;
+                    } else {
+                        int d = depth_choices[(int)(U(ws.rng) * n_depth) % n_depth];
+                        tp.max_depth = (d <= 0) ? 64 : d;
+                        tp.min_leaf = (int)std::lround(std::exp(
+                            std::log((double)leaf_lo) +
+                            U(ws.rng) * (std::log((double)leaf_hi) - std::log((double)leaf_lo))));
+                        tp.K = std::max(1, (int)std::lround((feat_lo + U(ws.rng) * (feat_hi - feat_lo)) * p));
+                        if (n_leafc > 1)
+                            tree_leaves = leaf_choices[(int)(U(ws.rng) * n_leafc) % n_leafc];
+                    }
                     tp.n_thresh = n_thresh;
                     tp.argmax_bins = argmax_bins;
                     tp.leaf_l2 = leaf_l2;
@@ -1578,8 +1681,8 @@ public:
 
                     GrownTree G;
                     G.feat.reserve(512);
-                    if (max_leaves > 0) {
-                        tp.max_leaves = max_leaves;
+                    if (tree_leaves > 0) {
+                        tp.max_leaves = tree_leaves;
                         grow_tree_leafwise(G, X, r.data(), n, p, ws, msub, tp);
                     } else if (msub >= (int64_t)hybrid_min) {
                         Hist* Hh = ws.acquire(p);
@@ -1603,8 +1706,9 @@ public:
                     // Small-holdout guard: subtrees the holdout never visits satisfy the
                     // collapse inequality trivially and would prune the tree to a stump.
                     if ((int64_t)hold.size() >= std::max<int64_t>(50, n / 50)) {
-                        const double lam = std::exp(std::log(lam_lo) +
-                            U(ws.rng) * (std::log(lam_hi) - std::log(lam_lo)));
+                        const double lam = cfg_now ? cfg_lam
+                            : std::exp(std::log(lam_lo) +
+                                       U(ws.rng) * (std::log(lam_hi) - std::log(lam_lo)));
                         prune_flags(G, K, lam, varh, collapsed, leaves);
                         exported_leaf_of(G, &collapsed, rep);
                         if (logistic) newton_refit(G, K, rep, ws.idx, r.data(), hrow.data(), leaf_l2, leaf_refit_all != 0);
@@ -1729,23 +1833,15 @@ public:
                         }
                     });
                 }
-                double mse = 0.0;
-                if (!logistic) {
-                    for (int64_t i = 0; i < nv * K; ++i) {
-                        const double e = yv[i] - Fv[(size_t)i];
-                        mse += e * e;
-                    }
-                } else {
-                    // validation deviance in place of the MSE
-                    std::vector<double> pv((size_t)nv * K);
-                    activate(Fv.data(), pv.data(), nv);
-                    for (int64_t i = 0; i < nv * K; ++i) {
-                        const double pi = std::min(1.0 - 1e-12, std::max(1e-12, pv[(size_t)i]));
-                        if (K == 1) mse -= yv[i] * std::log(pi) + (1.0 - yv[i]) * std::log(1.0 - pi);
-                        else mse -= yv[i] * std::log(pi);
-                    }
+                const double mse = val_loss();
+                if (adaptive && cfg_now) {
+                    // relative improvement, so shapes are comparable at any
+                    // point of a trajectory whose gains shrink as it converges
+                    const double rel = prev_loss > 1e-300 ? (prev_loss - mse) / prev_loss : 0.0;
+                    double& g = shape_gain[(size_t)cur_shape];
+                    g = shape_seen[(size_t)cur_shape]++ ? 0.5 * g + 0.5 * rel : rel;
                 }
-                mse /= (double)nv;
+                prev_loss = mse;
                 if (mse < best - tol) { best = mse; bad = 0; }
                 else if (++bad >= patience) break;
             }
@@ -2263,6 +2359,7 @@ PYBIND11_MODULE(_core, m) {
              py::arg("leaf_shrink"), py::arg("hist_bits"), py::arg("leaf_l2"), py::arg("loss"),
              py::arg("linear_feats"), py::arg("linear_lambda"), py::arg("feature_power"),
              py::arg("leaf_refit_all"), py::arg("honest_residuals"),
+             py::arg("config_scope"), py::arg("leaf_choices"), py::arg("config_search"),
              py::arg("hybrid_min"), py::arg("seed"), py::arg("n_jobs"),
              "Grow the batch-boosted dictionary. Returns (n_members, n_batches, oob_design).")
         .def("predict_members", &Ensemble::predict_members,
